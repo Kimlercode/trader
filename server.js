@@ -2,10 +2,12 @@ const express = require('express');
 const http = require('http');
 const WebSocket = require('ws');
 const path = require('path');
+const fs = require('fs');
 
 const app = express();
 const server = http.createServer(app);
 const PORT = process.env.PORT || 3000;
+const STATE_FILE = '/var/data/deriv_state.json';
 
 app.use(express.static(path.join(__dirname, 'public')));
 app.use(express.json());
@@ -17,7 +19,7 @@ let logId = 1;
 function addLog(msg) {
   const entry = { id: logId++, time: new Date().toISOString(), message: msg };
   state.logs.unshift(entry);
-  if (state.logs.length > 500) state.logs.pop();
+  if (state.logs.length > 200) state.logs.pop();
   broadcastSSE({ logs: [entry], state: sanitizeState() });
 }
 
@@ -30,120 +32,336 @@ function sanitizeState() {
   return rest;
 }
 
+// ---------- Markets ----------
+const MARKETS = {
+  R_10:  { name: 'Volatility 10 Index',  dp: 3, zoneLimit: 499 },
+  R_25:  { name: 'Volatility 25 Index',  dp: 3, zoneLimit: 499 },
+  R_50:  { name: 'Volatility 50 Index',  dp: 4, zoneLimit: 499 },
+  R_75:  { name: 'Volatility 75 Index',  dp: 4, zoneLimit: 499 },
+  R_100: { name: 'Volatility 100 Index', dp: 2, zoneLimit: 49  },
+};
+
+const FIXED_BARRIER = 4;
+const MIN_CONFIDENCE = 100;
+const HOUSE_EDGE = 0.98;
+const TREND_FILTER = true;
+
+const BASE_STAKE = 0.35;
+const MARTINGALE = 1.85;
+const VIRTUAL_LOSSES_NEEDED = 4;
+const COOLDOWN_TICKS = 5;
+const DAILY_PROFIT_CAP = 3.00;
+const DAILY_STOP_LOSS = 5.00;
+
+// ---------- Analyzer (multi‑market) ----------
+class Analyzer {
+  constructor() {
+    this.shortTicks = [];
+    this.shortCount = 0;
+    this.shortMean = new Array(10).fill(0);
+    this.shortM2 = new Array(10).fill(0);
+
+    this.longTicks = [];
+    this.longCount = 0;
+    this.longMean = new Array(10).fill(0);
+    this.longM2 = new Array(10).fill(0);
+
+    this.prices = [];
+  }
+
+  feed(price, dp) {
+    const digit = parseInt(parseFloat(price).toFixed(dp).slice(-1));
+    this.shortTicks.push(digit);
+    if (this.shortTicks.length > 1000) this.shortTicks.shift();
+    if (this.shortTicks.length >= 100) {
+      const recent = this.shortTicks.slice(-100);
+      const freq = {};
+      for (let d = 0; d < 10; d++) freq[d] = recent.filter(x => x === d).length / 100;
+      this.shortCount++;
+      for (let d = 0; d < 10; d++) {
+        const delta = freq[d] - this.shortMean[d];
+        this.shortMean[d] += delta / this.shortCount;
+        this.shortM2[d] += delta * (freq[d] - this.shortMean[d]);
+      }
+    }
+
+    this.longTicks.push(digit);
+    if (this.longTicks.length > 2000) this.longTicks.shift();
+    if (this.longTicks.length >= 500) {
+      const recent = this.longTicks.slice(-500);
+      const freq = {};
+      for (let d = 0; d < 10; d++) freq[d] = recent.filter(x => x === d).length / 500;
+      this.longCount++;
+      for (let d = 0; d < 10; d++) {
+        const delta = freq[d] - this.longMean[d];
+        this.longMean[d] += delta / this.longCount;
+        this.longM2[d] += delta * (freq[d] - this.longMean[d]);
+      }
+    }
+
+    this.prices.push(price);
+    if (this.prices.length > 500) this.prices.shift();
+  }
+
+  getAnalysis() {
+    if (this.shortCount < 5 || this.longCount < 2) return null;
+    const shortRecent = this.shortTicks.slice(-100);
+    const shortFreq = {};
+    for (let d = 0; d < 10; d++) shortFreq[d] = shortRecent.filter(x => x === d).length / 100;
+
+    const longRecent = this.longTicks.slice(-500);
+    const longFreq = {};
+    for (let d = 0; d < 10; d++) longFreq[d] = longRecent.filter(x => x === d).length / 500;
+
+    const zShort = {}, zLong = {};
+    for (let d = 0; d < 10; d++) {
+      const vs = this.shortM2[d] / (this.shortCount - 1), ss = Math.sqrt(vs) || 0.01;
+      zShort[d] = (shortFreq[d] - this.shortMean[d]) / ss;
+      const vl = this.longM2[d] / (this.longCount - 1), sl = Math.sqrt(vl) || 0.01;
+      zLong[d] = (longFreq[d] - this.longMean[d]) / sl;
+    }
+
+    let overConf = 0;
+    if (zShort[0] < 0 && zShort[1] < 0 && zLong[0] < 0 && zLong[1] < 0) {
+      const rareShort = Math.min(3, Math.max(0, -Math.min(zShort[0], zShort[1]))) / 3;
+      const rareLong  = Math.min(3, Math.max(0, -Math.min(zLong[0], zLong[1]))) / 3;
+      overConf = (rareShort * 0.4 + rareLong * 0.6 + 0.4) * 100;
+    }
+
+    let slope = 0;
+    if (this.prices.length >= 20) {
+      const rp = this.prices.slice(-20);
+      const n = rp.length;
+      let sx = 0, sy = 0, sxy = 0, sx2 = 0;
+      for (let i = 0; i < n; i++) {
+        sx += i; sy += rp[i]; sxy += i * rp[i]; sx2 += i * i;
+      }
+      slope = (n * sxy - sx * sy) / (n * sx2 - sx * sx);
+    }
+
+    return { overConf, slope };
+  }
+}
+
+const analyzers = {};
+for (const sym of Object.keys(MARKETS)) analyzers[sym] = new Analyzer();
+
 // ---------- State ----------
 const state = {
   active: false,
   balance: null,
   currency: 'USD',
-  sessionPnL: 0,
+  dailyStartBalance: null,
+  dailyPnl: 0,
   locked: false,
   lockReason: '',
-  currentStake: 0.35,
-  r100: { digits: [], lastPrice: null },
-  r25: { digits: [], lastPrice: null, lastDigit: null },
-  tradeInProgress: false,
-  activeTrade: null,
+
+  marketStates: {},
+  realTradeInProgress: false,
+  activeRealTrade: null,
+
+  marketSignals: {},
   logs: [],
+  sessionAlreadyUsedToday: false
 };
 
-// ---------- Risk / Martingale ----------
-const SESSION_TP = 10.0;
-const SESSION_SL = -10.0;
-const BASE_STAKE = 0.35;
-const MARTINGALE = 1.85;
-const BARRIER = 5;
-const HOUSE_EDGE = 0.98;
+for (const sym of Object.keys(MARKETS)) {
+  state.marketStates[sym] = {
+    mode: 'virtual',
+    virtualLosses: 0,
+    stake: BASE_STAKE,
+    cooldownTicksLeft: 0,
+    waitingForOutcome: false,
+  };
+}
 
-function checkLimits() {
-  if (state.sessionPnL >= SESSION_TP) {
+// ---------- Persistence ----------
+function saveState() {
+  try {
+    const dir = path.dirname(STATE_FILE);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(STATE_FILE, JSON.stringify({
+      date: new Date().toISOString().slice(0,10),
+      dailyStartBalance: state.dailyStartBalance,
+      dailyPnl: state.dailyPnl,
+      locked: state.locked,
+      lockReason: state.lockReason,
+      sessionActive: state.active,
+      marketStates: state.marketStates
+    }));
+  } catch(e) {}
+}
+
+function loadState() {
+  try {
+    if (fs.existsSync(STATE_FILE)) {
+      const saved = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
+      const today = new Date().toISOString().slice(0,10);
+      if (saved.date === today && saved.sessionActive) {
+        state.sessionAlreadyUsedToday = true;
+        state.locked = true;
+        state.lockReason = 'Session already used today.';
+        addLog(state.lockReason);
+      }
+      if (saved.date === today) {
+        state.dailyStartBalance = saved.dailyStartBalance;
+        state.dailyPnl = saved.dailyPnl || 0;
+        if (saved.locked) {
+          state.locked = true;
+          state.lockReason = saved.lockReason || '';
+        }
+        if (saved.marketStates) {
+          for (const sym of Object.keys(MARKETS)) {
+            if (saved.marketStates[sym]) state.marketStates[sym] = saved.marketStates[sym];
+          }
+        }
+      }
+    }
+  } catch(e) {}
+}
+
+// ---------- Helpers ----------
+function checkDailyLimits() {
+  if (!state.dailyStartBalance) return false;
+  if (state.dailyPnl >= DAILY_PROFIT_CAP) {
     state.locked = true;
-    state.lockReason = `Take-profit $${SESSION_TP} reached.`;
+    state.lockReason = `Daily profit target $${DAILY_PROFIT_CAP} reached.`;
     addLog(state.lockReason);
     return true;
   }
-  if (state.sessionPnL <= SESSION_SL) {
+  if (state.dailyPnl <= -DAILY_STOP_LOSS) {
     state.locked = true;
-    state.lockReason = `Stop-loss $${SESSION_SL} hit.`;
+    state.lockReason = `Daily stop-loss $${DAILY_STOP_LOSS} hit.`;
     addLog(state.lockReason);
     return true;
   }
   return false;
 }
 
-function processR100Tick(price) {
-  state.r100.lastPrice = price;
-  const digit = parseInt(parseFloat(price).toFixed(2).slice(-1));
-  state.r100.digits.push(digit);
-  if (state.r100.digits.length > 10) state.r100.digits.shift();
-  addLog(`[R_100] price=${price} digit=${digit}`);
-}
-
-function processR25Tick(price) {
-  state.r25.lastPrice = price;
-  const digit = parseInt(parseFloat(price).toFixed(3).slice(-1));
-  state.r25.lastDigit = digit;
-  state.r25.digits.push(digit);
-  if (state.r25.digits.length > 10) state.r25.digits.shift();
-  addLog(`[R_25] price=${price} digit=${digit}`);
-
-  if (!state.active || state.locked || state.tradeInProgress) return;
-
-  const d = state.r100.digits;
-  if (d.length < 4) return;
-  const last4 = d.slice(-4);
-  const diffs = [last4[1]-last4[0], last4[2]-last4[1], last4[3]-last4[2]];
-  const absDiffs = diffs.map(Math.abs);
-  if (absDiffs[0] <= absDiffs[1] || absDiffs[1] <= absDiffs[2]) return;
-  if (last4[3] < 7) return;
-  if (digit < 5) return;
-
-  addLog(`[LLCM SIGNAL] R_100 deceleration + extreme high, R_25 digit=${digit} → DIGITUNDER barrier ${BARRIER}`);
-
-  state.tradeInProgress = true;
-  const rawStake = Math.min(state.currentStake, state.balance);
-  const stakeToUse = Math.round(rawStake * 100) / 100;   // ✅ force 2 decimals
-
-  state.activeTrade = {
-    market: 'R_25',
-    direction: 'under',
-    barrier: BARRIER,
-    stake: stakeToUse,
-    balanceBefore: state.balance,
-  };
-
-  send({
-    proposal: 1,
-    amount: stakeToUse,
-    basis: 'stake',
-    currency: state.currency || 'USD',
-    duration: 1,
-    duration_unit: 't',
-    symbol: 'R_25',
-    contract_type: 'DIGITUNDER',
-    barrier: BARRIER,
-    req_id: ++reqId
-  });
-}
-
-function settleTrade(contract) {
-  if (!state.activeTrade) return;
-  const profit = typeof contract.profit === 'number' ? contract.profit : parseFloat(contract.profit) || 0;
-  state.sessionPnL += profit;
-  addLog(`[TRADE RESULT] ${profit >= 0 ? 'WIN' : 'LOSS'} | Profit: ${profit.toFixed(2)} | Session P&L: ${state.sessionPnL.toFixed(2)}`);
-
-  // Martingale
-  if (profit >= 0) {
-    state.currentStake = BASE_STAKE;
+function inZone(price, dp, limit) {
+  const s = parseFloat(price).toFixed(dp);
+  const dec = s.split('.')[1] || '';
+  if (dp === 2) {
+    const two = parseInt(dec.slice(-2));
+    return !isNaN(two) && two <= limit;
   } else {
-    state.currentStake = Math.min(state.currentStake * MARTINGALE, state.balance);
-    state.currentStake = Math.round(state.currentStake * 100) / 100;   // ✅ keep it clean
+    const three = parseInt(dec.slice(-3));
+    return !isNaN(three) && three <= limit;
+  }
+}
+
+function payout() {
+  return (10 / (9 - FIXED_BARRIER)) * HOUSE_EDGE;
+}
+
+// ---------- Virtual outcome resolution ----------
+function resolveVirtualOutcome(sym, currentPrice) {
+  const ms = state.marketStates[sym];
+  if (!ms.waitingForOutcome) return;
+  ms.waitingForOutcome = false;
+
+  const lastDigit = parseInt(parseFloat(currentPrice).toFixed(MARKETS[sym].dp).slice(-1));
+  const win = lastDigit > FIXED_BARRIER;
+
+  if (win) {
+    ms.virtualLosses = 0;
+    addLog(`${MARKETS[sym].name} VIRTUAL WIN – losses reset`);
+  } else {
+    ms.virtualLosses++;
+    addLog(`${MARKETS[sym].name} VIRTUAL LOSS (${ms.virtualLosses}/${VIRTUAL_LOSSES_NEEDED})`);
+    if (ms.virtualLosses >= VIRTUAL_LOSSES_NEEDED) {
+      ms.mode = 'real';
+      addLog(`${MARKETS[sym].name} → REAL mode`);
+    }
+  }
+  ms.cooldownTicksLeft = COOLDOWN_TICKS;
+}
+
+// ---------- Real trade settlement ----------
+function settleRealTrade(contract) {
+  if (!state.activeRealTrade) return;
+  const trade = state.activeRealTrade;
+  const profit = typeof contract.profit === 'number' ? contract.profit : parseFloat(contract.profit) || 0;
+  state.dailyPnl += profit;
+  const result = profit >= 0 ? 'WIN' : 'LOSS';
+  addLog(`${MARKETS[trade.market].name} REAL ${result}: ${profit.toFixed(2)} | Daily P&L: ${state.dailyPnl.toFixed(2)}`);
+
+  const ms = state.marketStates[trade.market];
+  if (profit >= 0) {
+    ms.stake = BASE_STAKE;
+    ms.mode = 'virtual';
+    ms.virtualLosses = 0;
+  } else {
+    ms.stake = Math.min(ms.stake * MARTINGALE, state.balance);
+    // stay real until a win
   }
 
-  state.tradeInProgress = false;
-  state.activeTrade = null;
+  state.realTradeInProgress = false;
+  state.activeRealTrade = null;
+  ms.cooldownTicksLeft = COOLDOWN_TICKS;
 
-  if (checkLimits()) {
-    state.active = false;
+  checkDailyLimits();
+  saveState();
+  broadcastSSE({ state: sanitizeState() });
+}
+
+// ---------- Tick processing ----------
+function processTick(sym, price) {
+  const market = MARKETS[sym];
+  const analyzer = analyzers[sym];
+  analyzer.feed(price, market.dp);
+
+  const analysis = analyzer.getAnalysis();
+  if (analysis) {
+    state.marketSignals[sym] = {
+      overConf: analysis.overConf.toFixed(1),
+      trend: analysis.slope > 0.0001 ? 'up' : (analysis.slope < -0.0001 ? 'down' : 'flat')
+    };
+  }
+
+  if (!state.active || state.locked) return;
+
+  const ms = state.marketStates[sym];
+
+  if (ms.waitingForOutcome) {
+    resolveVirtualOutcome(sym, price);
+    broadcastSSE({ state: sanitizeState() });
+    return;
+  }
+
+  if (ms.cooldownTicksLeft > 0) {
+    ms.cooldownTicksLeft--;
+    return;
+  }
+
+  if (state.realTradeInProgress) return;
+
+  if (!analysis || analysis.overConf < MIN_CONFIDENCE) return;
+  if (!inZone(price, market.dp, market.zoneLimit)) return;
+  if (TREND_FILTER && analysis.slope < -0.0001) return;
+
+  if (ms.mode === 'virtual') {
+    ms.waitingForOutcome = true;
+    addLog(`${market.name} VIRTUAL entry – awaiting next tick`);
+  } else {
+    state.realTradeInProgress = true;
+    const rawStake = Math.min(ms.stake, state.balance);
+    const stake = Math.round(rawStake * 100) / 100;   // ✅ force 2 decimals
+    const contractType = 'DIGITOVER';
+    addLog(`${market.name} REAL entry – stake ${stake.toFixed(2)}`);
+    state.activeRealTrade = { market: sym, stake };
+    send({
+      proposal: 1,
+      amount: stake,
+      basis: 'stake',
+      currency: state.currency || 'USD',
+      duration: 1,
+      duration_unit: 't',
+      symbol: sym,
+      contract_type: contractType,
+      barrier: FIXED_BARRIER,
+      req_id: ++reqId
+    });
   }
 
   broadcastSSE({ state: sanitizeState() });
@@ -162,7 +380,7 @@ function connectDeriv() {
   const appId = process.env.DERIV_APP_ID;
   derivWs = new WebSocket(`wss://ws.binaryws.com/websockets/v3?app_id=${appId}`);
   derivWs.on('open', () => {
-    addLog('Connected to Deriv. Authorizing...');
+    addLog('Connected. Authorizing...');
     send({ authorize: process.env.DERIV_API_TOKEN });
   });
   derivWs.on('message', data => {
@@ -176,21 +394,20 @@ function handleMessage(msg) {
   if (msg.error) {
     addLog(`Deriv error: ${msg.error.message}`);
     // ✅ If a trade proposal failed, abort the trade so the bot can recover
-    if (state.tradeInProgress) {
-      state.tradeInProgress = false;
-      state.activeTrade = null;
+    if (state.realTradeInProgress) {
+      state.realTradeInProgress = false;
+      state.activeRealTrade = null;
       addLog('Trade aborted – bot will retry on next signal.');
     }
     return;
   }
 
   if (msg.msg_type === 'authorize') {
-    addLog('Authorized. Subscribing to balance & ticks.');
+    addLog('Authorized. Subscribing to balance & all ticks.');
     send({ balance: 1, subscribe: 1, req_id: ++reqId });
-    send({ ticks: 'R_100', req_id: ++reqId });
-    send({ ticks: 'R_25', req_id: ++reqId });
-    send({ ticks_history: 'R_100', count: 100, end: 'latest', req_id: ++reqId });
-    send({ ticks_history: 'R_25', count: 100, end: 'latest', req_id: ++reqId });
+    for (const sym of Object.keys(MARKETS)) {
+      send({ ticks_history: sym, count: 1000, end: 'latest', req_id: ++reqId });
+    }
   }
   else if (msg.msg_type === 'balance') {
     state.balance = parseFloat(msg.balance.balance);
@@ -199,19 +416,16 @@ function handleMessage(msg) {
   }
   else if (msg.msg_type === 'history') {
     const sym = msg.echo_req.ticks_history;
-    const prices = msg.history.prices;
-    if (prices) {
-      for (const p of prices) {
-        if (sym === 'R_100') processR100Tick(parseFloat(p));
-        else if (sym === 'R_25') processR25Tick(parseFloat(p));
-      }
+    const analyzer = analyzers[sym];
+    if (analyzer && msg.history && msg.history.prices) {
+      for (const p of msg.history.prices) analyzer.feed(p, MARKETS[sym].dp);
+      send({ ticks: sym, req_id: ++reqId });
     }
   }
   else if (msg.msg_type === 'tick') {
     const sym = msg.tick.symbol;
-    const price = parseFloat(msg.tick.quote);
-    if (sym === 'R_100') processR100Tick(price);
-    else if (sym === 'R_25') processR25Tick(price);
+    if (!MARKETS[sym]) return;
+    processTick(sym, parseFloat(msg.tick.quote));
     broadcastSSE({ state: sanitizeState() });
   }
   else if (msg.msg_type === 'proposal') {
@@ -222,8 +436,8 @@ function handleMessage(msg) {
     send({ proposal_open_contract: 1, contract_id: msg.buy.contract_id, subscribe: 1, req_id: ++reqId });
   }
   else if (msg.msg_type === 'proposal_open_contract') {
-    if (state.activeTrade) {
-      settleTrade(msg.proposal_open_contract);
+    if (state.activeRealTrade) {
+      settleRealTrade(msg.proposal_open_contract);
       broadcastSSE({ state: sanitizeState() });
     }
   }
@@ -243,19 +457,28 @@ app.get('/api/state', (req, res) => res.json({ ...state, logs: undefined }));
 app.post('/api/control', (req, res) => {
   const { action } = req.body;
   if (action === 'start') {
-    state.active = true; state.locked = false; state.sessionPnL = 0; state.lockReason = '';
-    state.currentStake = BASE_STAKE;
-    state.r100.digits = []; state.r25.digits = [];
-    state.tradeInProgress = false; state.activeTrade = null;
-    addLog('LLCM trading started (Martingale 1.85).');
+    if (state.sessionAlreadyUsedToday) return res.status(403).json({ error: 'Session already used today.' });
+    state.active = true; state.locked = false;
+    state.dailyStartBalance = state.balance; state.dailyPnl = 0; state.lockReason = '';
+    for (const sym of Object.keys(MARKETS)) {
+      state.marketStates[sym] = {
+        mode: 'virtual', virtualLosses: 0, stake: BASE_STAKE,
+        cooldownTicksLeft: 0, waitingForOutcome: false
+      };
+    }
+    state.realTradeInProgress = false; state.activeRealTrade = null;
+    addLog('Trading started – 4 virtual losses, 5‑tick cooldown.');
+    saveState();
   } else if (action === 'stop') {
     state.active = false;
-    state.tradeInProgress = false; state.activeTrade = null;
-    addLog('Trading stopped manually.');
+    state.realTradeInProgress = false; state.activeRealTrade = null;
+    addLog('Trading stopped.');
+    saveState();
   }
   broadcastSSE({ state: sanitizeState() });
   res.json({ success: true });
 });
 
+loadState();
 connectDeriv();
-server.listen(PORT, () => console.log(`LLCM + Martingale server on port ${PORT}`));
+server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
