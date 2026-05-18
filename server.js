@@ -100,7 +100,9 @@ function processR25Tick(price) {
   addLog(`[LLCM SIGNAL] R_100 deceleration + extreme high, R_25 digit=${digit} → DIGITUNDER barrier ${BARRIER}`);
 
   state.tradeInProgress = true;
-  const stakeToUse = Math.min(state.currentStake, state.balance);
+  const rawStake = Math.min(state.currentStake, state.balance);
+  const stakeToUse = Math.round(rawStake * 100) / 100;   // ✅ force 2 decimals
+
   state.activeTrade = {
     market: 'R_25',
     direction: 'under',
@@ -134,6 +136,7 @@ function settleTrade(contract) {
     state.currentStake = BASE_STAKE;
   } else {
     state.currentStake = Math.min(state.currentStake * MARTINGALE, state.balance);
+    state.currentStake = Math.round(state.currentStake * 100) / 100;   // ✅ keep it clean
   }
 
   state.tradeInProgress = false;
@@ -170,7 +173,16 @@ function connectDeriv() {
 }
 
 function handleMessage(msg) {
-  if (msg.error) return addLog(`Deriv error: ${msg.error.message}`);
+  if (msg.error) {
+    addLog(`Deriv error: ${msg.error.message}`);
+    // ✅ If a trade proposal failed, abort the trade so the bot can recover
+    if (state.tradeInProgress) {
+      state.tradeInProgress = false;
+      state.activeTrade = null;
+      addLog('Trade aborted – bot will retry on next signal.');
+    }
+    return;
+  }
 
   if (msg.msg_type === 'authorize') {
     addLog('Authorized. Subscribing to balance & ticks.');
