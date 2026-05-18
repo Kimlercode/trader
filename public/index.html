@@ -2,13 +2,13 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>LLCM Trading</title>
+<title>Virtual‑Loss Trading Bot</title>
 <style>
   * { margin:0; padding:0; box-sizing:border-box; }
   body { font-family:'Segoe UI',Tahoma,Geneva,Verdana,sans-serif; background:#0b0f14; color:#c9d1d9; }
-  .container { max-width:900px; margin:30px auto; padding:20px; }
+  .container { max-width:950px; margin:30px auto; padding:20px; }
+
   .header { display:flex; justify-content:space-between; align-items:center; margin-bottom:20px; }
-  .header h1 { font-size:24px; font-weight:600; letter-spacing:0.5px; }
   .status-badge { padding:5px 15px; border-radius:20px; font-size:14px; font-weight:600; }
   .status-running { background:#1a7f37; color:#fff; }
   .status-stopped { background:#cf222e; color:#fff; }
@@ -20,29 +20,26 @@
   .card .value { font-size:28px; font-weight:600; }
   .green { color:#3fb950; } .red { color:#f85149; } .blue { color:#58a6ff; }
 
-  .btn { padding:10px 25px; border:none; border-radius:6px; font-weight:600; cursor:pointer; transition:background 0.2s; }
+  .btn { padding:10px 25px; border:none; border-radius:6px; font-weight:600; cursor:pointer; transition:opacity 0.2s; }
   .btn-start { background:#238636; color:white; }
-  .btn-start:hover { background:#2ea043; }
   .btn-stop { background:#da3633; color:white; }
-  .btn-stop:hover { background:#f85149; }
   .btn:disabled { opacity:0.4; cursor:not-allowed; }
 
-  .log-container { background:#0d1117; border:1px solid #30363d; border-radius:8px; padding:15px; margin-top:20px; }
+  .market-table { width:100%; border-collapse:collapse; margin-bottom:25px; background:#161b22; border:1px solid #30363d; border-radius:8px; overflow:hidden; }
+  .market-table th, .market-table td { padding:10px; text-align:center; border-bottom:1px solid #30363d; font-size:14px; }
+  .market-table th { background:#21262d; color:#8b949e; text-transform:uppercase; font-size:12px; }
+
+  .log-container { background:#0d1117; border:1px solid #30363d; border-radius:8px; padding:15px; }
   .log-container h2 { font-size:16px; margin-bottom:10px; color:#8b949e; }
-  #logs { height:400px; overflow-y:auto; font-family:'Cascadia Code','Fira Code',monospace; font-size:13px; line-height:1.6; }
+  #logs { height:350px; overflow-y:auto; font-family:'Cascadia Code','Fira Code',monospace; font-size:13px; line-height:1.6; }
   .log-entry { padding:3px 0; border-bottom:1px solid #21262d; color:#c9d1d9; }
   .log-entry .time { color:#58a6ff; margin-right:10px; }
-
-  .market-row { display:flex; gap:20px; margin-bottom:15px; }
-  .market-info { flex:1; background:#161b22; border:1px solid #30363d; border-radius:8px; padding:12px; }
-  .market-info h4 { color:#8b949e; font-size:12px; text-transform:uppercase; }
-  .market-info .last-digit { font-size:24px; font-weight:600; }
 </style>
 </head>
 <body>
 <div class="container">
   <div class="header">
-    <h1>⚡ LLCM Trading Engine</h1>
+    <h1>⚡ Virtual‑Loss Trading</h1>
     <span id="statusBadge" class="status-badge status-stopped">Stopped</span>
   </div>
 
@@ -52,37 +49,34 @@
       <div class="value blue" id="balance">--</div>
     </div>
     <div class="card">
-      <h3>Session P&L</h3>
-      <div class="value" id="sessionPnL">0.00</div>
+      <h3>Daily P&L</h3>
+      <div class="value" id="dailyPnl">0.00</div>
     </div>
     <div class="card">
       <h3>Take Profit</h3>
-      <div class="value green">$10.00</div>
+      <div class="value green">$3.00</div>
     </div>
     <div class="card">
       <h3>Stop Loss</h3>
-      <div class="value red">$10.00</div>
+      <div class="value red">$5.00</div>
     </div>
   </div>
 
-  <div class="market-row">
-    <div class="market-info">
-      <h4>R_100 (Lead)</h4>
-      <div>Last digit: <span class="last-digit" id="r100Digit">-</span></div>
-    </div>
-    <div class="market-info">
-      <h4>R_25 (Follower)</h4>
-      <div>Last digit: <span class="last-digit" id="r25Digit">-</span></div>
-    </div>
-  </div>
+  <h3 style="margin-bottom:10px; color:#8b949e;">Market Status</h3>
+  <table class="market-table" id="marketTable">
+    <thead>
+      <tr><th>Market</th><th>Mode</th><th>VL (out of 4)</th><th>Cooldown</th><th>Confidence</th><th>Trend</th></tr>
+    </thead>
+    <tbody></tbody>
+  </table>
 
-  <div>
+  <div style="margin-bottom:20px;">
     <button class="btn btn-start" id="startBtn" onclick="start()">▶ Start Trading</button>
-    <button class="btn btn-stop" id="stopBtn" onclick="stop()" disabled>⏹ Stop</button>
+    <button class="btn btn-stop" id="stopBtn" onclick="stop()" disabled>⏹ Stop Trading</button>
   </div>
 
   <div class="log-container">
-    <h2>Event Log</h2>
+    <h2>Trade Logs</h2>
     <div id="logs"></div>
   </div>
 </div>
@@ -105,9 +99,10 @@ es.onmessage = e => {
 };
 
 function updateUI(s) {
-  document.getElementById('balance').textContent = s.balance ? `${parseFloat(s.balance).toFixed(2)} ${s.currency}` : '--';
-  document.getElementById('sessionPnL').textContent = s.sessionPnL !== undefined ? (s.sessionPnL >=0 ? '+' : '') + s.sessionPnL.toFixed(2) : '0.00';
-  document.getElementById('sessionPnL').className = 'value ' + (s.sessionPnL >= 0 ? 'green' : 'red');
+  document.getElementById('balance').textContent = s.balance ? `$${parseFloat(s.balance).toFixed(2)}` : '--';
+  const pnl = s.dailyPnl || 0;
+  document.getElementById('dailyPnl').textContent = (pnl >= 0 ? '+' : '') + pnl.toFixed(2);
+  document.getElementById('dailyPnl').className = 'value ' + (pnl >= 0 ? 'green' : 'red');
 
   const badge = document.getElementById('statusBadge');
   if (s.locked) {
@@ -121,11 +116,29 @@ function updateUI(s) {
     badge.className = 'status-badge status-stopped';
   }
 
-  document.getElementById('startBtn').disabled = s.active || s.locked;
+  document.getElementById('startBtn').disabled = s.active || s.locked || s.sessionAlreadyUsedToday;
   document.getElementById('stopBtn').disabled = !s.active;
 
-  document.getElementById('r100Digit').textContent = s.r100?.digits?.slice(-1)[0] ?? '-';
-  document.getElementById('r25Digit').textContent = s.r25?.lastDigit ?? '-';
+  const tbody = document.querySelector('#marketTable tbody');
+  tbody.innerHTML = '';
+  if (s.marketStates && s.marketSignals) {
+    const order = ['R_10','R_25','R_50','R_75','R_100'];
+    for (const sym of order) {
+      const ms = s.marketStates[sym];
+      const sig = s.marketSignals[sym];
+      if (!ms) continue;
+      const tr = document.createElement('tr');
+      tr.innerHTML = `
+        <td><strong>${sym}</strong></td>
+        <td style="color:${ms.mode==='real'?'#f85149':'#58a6ff'}">${ms.mode}</td>
+        <td>${ms.virtualLosses}/4</td>
+        <td>${ms.cooldownTicksLeft}</td>
+        <td>${sig ? sig.overConf + '%' : '-'}</td>
+        <td>${sig ? sig.trend : '-'}</td>
+      `;
+      tbody.appendChild(tr);
+    }
+  }
 }
 
 function start() {
