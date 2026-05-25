@@ -48,10 +48,11 @@ const TREND_FILTER = true;
 
 const BASE_STAKE = 0.35;
 const MARTINGALE = 1.85;
-const VIRTUAL_LOSSES_NEEDED = 2;
+const VIRTUAL_LOSSES_NEEDED = 3;          // as you requested
 const COOLDOWN_TICKS = 5;
 const DAILY_PROFIT_CAP = 3.00;
 const DAILY_STOP_LOSS = 5.00;
+const SETTLE_TICKS = 15;                  // ticks to wait for balance update
 
 // ---------- Analyzer (multi‑market) ----------
 class Analyzer {
@@ -158,7 +159,8 @@ const state = {
 
   marketStates: {},
   realTradeInProgress: false,
-  activeRealTrade: null,            // { market, stake, balanceBefore, timer }
+  activeRealTrade: null,            // { market, stake, balanceBefore }
+  settleTicksRemaining: 0,
 
   marketSignals: {},
   logs: [],
@@ -267,33 +269,39 @@ function resolveVirtualOutcome(sym, currentPrice) {
     addLog(`${MARKETS[sym].name} VIRTUAL LOSS (${ms.virtualLosses}/${VIRTUAL_LOSSES_NEEDED})`);
     if (ms.virtualLosses >= VIRTUAL_LOSSES_NEEDED) {
       ms.mode = 'real';
+      // martingale stake preserved
       addLog(`${MARKETS[sym].name} → REAL mode (stake $${ms.stake.toFixed(2)})`);
     }
   }
   ms.cooldownTicksLeft = COOLDOWN_TICKS;
 }
 
-// ---------- Real trade settlement (balance‑based) ----------
-function settleRealTradeByBalance() {
-  if (!state.activeRealTrade || !state.balance) return;
+// ---------- Real trade settlement (tick‑based balance change) ----------
+function settleRealTrade() {
+  if (!state.activeRealTrade || state.balance == null) return;
   const trade = state.activeRealTrade;
   const profit = state.balance - trade.balanceBefore;
   state.dailyPnl += profit;
-
-  const result = profit >= 0 ? 'WIN' : 'LOSS';
+  const result = profit > 0 ? 'WIN' : (profit < 0 ? 'LOSS' : 'DRAW');
   addLog(`${MARKETS[trade.market].name} REAL ${result}: ${profit.toFixed(2)} | Daily P&L: ${state.dailyPnl.toFixed(2)}`);
 
   const ms = state.marketStates[trade.market];
-  if (profit >= 0) {
+  if (profit > 0) {
     ms.stake = BASE_STAKE;
     ms.mode = 'virtual';
     ms.virtualLosses = 0;
-  } else {
+  } else if (profit < 0) {
     ms.stake = Math.min(ms.stake * MARTINGALE, state.balance);
+    // stay real until a win (original behaviour)
+  } else {
+    // draw – go back to virtual, stake unchanged
+    ms.mode = 'virtual';
+    ms.virtualLosses = 0;
   }
 
   state.realTradeInProgress = false;
   state.activeRealTrade = null;
+  state.settleTicksRemaining = 0;
   ms.cooldownTicksLeft = COOLDOWN_TICKS;
 
   checkDailyLimits();
@@ -317,21 +325,35 @@ function processTick(sym, price) {
 
   if (!state.active || state.locked) return;
 
+  // 1. If we are counting ticks for settlement, handle that first
+  if (state.settleTicksRemaining > 0) {
+    state.settleTicksRemaining--;
+    if (state.settleTicksRemaining === 0) {
+      settleRealTrade();
+    }
+    broadcastSSE({ state: sanitizeState() });
+    return;
+  }
+
   const ms = state.marketStates[sym];
 
+  // 2. Resolve pending virtual outcome
   if (ms.waitingForOutcome) {
     resolveVirtualOutcome(sym, price);
     broadcastSSE({ state: sanitizeState() });
     return;
   }
 
+  // 3. Cooldown
   if (ms.cooldownTicksLeft > 0) {
     ms.cooldownTicksLeft--;
     return;
   }
 
+  // 4. Global lock – only one real trade at a time
   if (state.realTradeInProgress) return;
 
+  // 5. Signal checks
   if (!analysis || analysis.overConf < MIN_CONFIDENCE) return;
   if (!inZone(price, market.dp, market.zoneLimit)) return;
   if (TREND_FILTER && analysis.slope < -0.0001) return;
@@ -340,6 +362,7 @@ function processTick(sym, price) {
     ms.waitingForOutcome = true;
     addLog(`${market.name} VIRTUAL entry – awaiting next tick`);
   } else {
+    // Real trade
     state.realTradeInProgress = true;
     const rawStake = Math.min(ms.stake, state.balance);
     const stake = Math.round(rawStake * 100) / 100;
@@ -350,8 +373,7 @@ function processTick(sym, price) {
     state.activeRealTrade = {
       market: sym,
       stake,
-      balanceBefore: state.balance,
-      timer: null
+      balanceBefore: state.balance,   // captured before proposal
     };
 
     send({
@@ -361,9 +383,10 @@ function processTick(sym, price) {
       currency: state.currency || 'USD',
       duration: 1,
       duration_unit: 't',
-      symbol: sym,                   // legacy API field name
+      symbol: sym,
       contract_type: contractType,
-      barrier: FIXED_BARRIER
+      barrier: FIXED_BARRIER,
+      req_id: ++reqId
     });
   }
 
@@ -396,9 +419,10 @@ function connectDeriv() {
 function handleMessage(msg) {
   if (msg.error) {
     addLog(`Deriv error: ${msg.error.message}`);
-    if (state.realTradeInProgress && state.activeRealTrade) {
+    if (state.realTradeInProgress) {
       state.realTradeInProgress = false;
       state.activeRealTrade = null;
+      state.settleTicksRemaining = 0;
       addLog('Trade aborted due to API error – bot will retry on next signal.');
     }
     return;
@@ -436,12 +460,11 @@ function handleMessage(msg) {
   else if (msg.msg_type === 'buy') {
     addLog(`Contract bought – ID ${msg.buy.contract_id}`);
     if (state.activeRealTrade) {
-      const trade = state.activeRealTrade;
-      trade.balanceBefore = state.balance;
-      if (trade.timer) clearTimeout(trade.timer);
-      trade.timer = setTimeout(() => settleRealTradeByBalance(), 15000);
+      // Start counting 15 ticks for settlement
+      state.settleTicksRemaining = SETTLE_TICKS;
     }
   }
+  // Ignore proposal_open_contract – we use balance change after tick wait
 }
 
 // ---------- API ----------
@@ -467,15 +490,12 @@ app.post('/api/control', (req, res) => {
         cooldownTicksLeft: 0, waitingForOutcome: false
       };
     }
-    state.realTradeInProgress = false; state.activeRealTrade = null;
-    addLog('Multi-market z‑score bot started (legacy auth, martingale fixed, VL=2).');
+    state.realTradeInProgress = false; state.activeRealTrade = null; state.settleTicksRemaining = 0;
+    addLog('Multi-market z‑score bot started (legacy auth, VL=3, 15‑tick balance settlement).');
     saveState();
   } else if (action === 'stop') {
     state.active = false;
-    if (state.activeRealTrade && state.activeRealTrade.timer) {
-      clearTimeout(state.activeRealTrade.timer);
-    }
-    state.realTradeInProgress = false; state.activeRealTrade = null;
+    state.realTradeInProgress = false; state.activeRealTrade = null; state.settleTicksRemaining = 0;
     addLog('Trading stopped.');
     saveState();
   }
