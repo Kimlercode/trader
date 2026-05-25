@@ -47,9 +47,9 @@ const HOUSE_EDGE = 0.98;
 const TREND_FILTER = true;
 
 const BASE_STAKE = 0.35;
-const MARTINGALE = 1.85;
-const VIRTUAL_LOSSES_NEEDED = 3;          // 3 virtual losses required
-const COOLDOWN_TICKS = 5;
+const MARTINGALE = 1.5;
+const VIRTUAL_LOSSES_NEEDED = 2;          // 2 virtual losses required
+const COOLDOWN_TICKS = 15;
 const DAILY_PROFIT_CAP = 3.00;
 const DAILY_STOP_LOSS = 5.00;
 const SETTLE_TICKS = 15;                  // 15‑tick balance settlement
