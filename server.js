@@ -48,11 +48,11 @@ const TREND_FILTER = true;
 
 const BASE_STAKE = 0.35;
 const MARTINGALE = 1.85;
-const VIRTUAL_LOSSES_NEEDED = 3;          // as you requested
+const VIRTUAL_LOSSES_NEEDED = 3;          // 3 virtual losses required
 const COOLDOWN_TICKS = 5;
 const DAILY_PROFIT_CAP = 3.00;
 const DAILY_STOP_LOSS = 5.00;
-const SETTLE_TICKS = 15;                  // ticks to wait for balance update
+const SETTLE_TICKS = 15;                  // 15‑tick balance settlement
 
 // ---------- Analyzer (multi‑market) ----------
 class Analyzer {
@@ -269,14 +269,14 @@ function resolveVirtualOutcome(sym, currentPrice) {
     addLog(`${MARKETS[sym].name} VIRTUAL LOSS (${ms.virtualLosses}/${VIRTUAL_LOSSES_NEEDED})`);
     if (ms.virtualLosses >= VIRTUAL_LOSSES_NEEDED) {
       ms.mode = 'real';
-      // martingale stake preserved
+      // stake is NOT reset here – martingale preserved from previous real loss
       addLog(`${MARKETS[sym].name} → REAL mode (stake $${ms.stake.toFixed(2)})`);
     }
   }
   ms.cooldownTicksLeft = COOLDOWN_TICKS;
 }
 
-// ---------- Real trade settlement (tick‑based balance change) ----------
+// ---------- Real trade settlement (tick‑based balance change, ALWAYS retreat to virtual) ----------
 function settleRealTrade() {
   if (!state.activeRealTrade || state.balance == null) return;
   const trade = state.activeRealTrade;
@@ -286,18 +286,19 @@ function settleRealTrade() {
   addLog(`${MARKETS[trade.market].name} REAL ${result}: ${profit.toFixed(2)} | Daily P&L: ${state.dailyPnl.toFixed(2)}`);
 
   const ms = state.marketStates[trade.market];
+
+  // Martingale
   if (profit > 0) {
-    ms.stake = BASE_STAKE;
-    ms.mode = 'virtual';
-    ms.virtualLosses = 0;
+    ms.stake = BASE_STAKE;                     // reset only on a real win
   } else if (profit < 0) {
     ms.stake = Math.min(ms.stake * MARTINGALE, state.balance);
-    // stay real until a win (original behaviour)
-  } else {
-    // draw – go back to virtual, stake unchanged
-    ms.mode = 'virtual';
-    ms.virtualLosses = 0;
   }
+  // draw: stake unchanged
+
+  // ALWAYS retreat to virtual – this is the over3‑style safety rule
+  ms.mode = 'virtual';
+  ms.virtualLosses = 0;
+  addLog(`${MARKETS[trade.market].name} → Back to VIRTUAL (next real stake: $${ms.stake.toFixed(2)})`);
 
   state.realTradeInProgress = false;
   state.activeRealTrade = null;
@@ -325,7 +326,7 @@ function processTick(sym, price) {
 
   if (!state.active || state.locked) return;
 
-  // 1. If we are counting ticks for settlement, handle that first
+  // 1. Tick‑based settlement countdown
   if (state.settleTicksRemaining > 0) {
     state.settleTicksRemaining--;
     if (state.settleTicksRemaining === 0) {
@@ -373,7 +374,7 @@ function processTick(sym, price) {
     state.activeRealTrade = {
       market: sym,
       stake,
-      balanceBefore: state.balance,   // captured before proposal
+      balanceBefore: state.balance,
     };
 
     send({
@@ -460,11 +461,9 @@ function handleMessage(msg) {
   else if (msg.msg_type === 'buy') {
     addLog(`Contract bought – ID ${msg.buy.contract_id}`);
     if (state.activeRealTrade) {
-      // Start counting 15 ticks for settlement
       state.settleTicksRemaining = SETTLE_TICKS;
     }
   }
-  // Ignore proposal_open_contract – we use balance change after tick wait
 }
 
 // ---------- API ----------
@@ -491,7 +490,7 @@ app.post('/api/control', (req, res) => {
       };
     }
     state.realTradeInProgress = false; state.activeRealTrade = null; state.settleTicksRemaining = 0;
-    addLog('Multi-market z‑score bot started (legacy auth, VL=3, 15‑tick balance settlement).');
+    addLog('Multi-market z‑score bot started (retreat logic, VL=3, 15‑tick balance settlement).');
     saveState();
   } else if (action === 'stop') {
     state.active = false;
