@@ -34,11 +34,7 @@ function sanitizeState() {
 
 // ---------- Markets ----------
 const MARKETS = {
-  R_10:  { name: 'Volatility 10 Index',  dp: 3, zoneLimit: 499 },
-  R_25:  { name: 'Volatility 25 Index',  dp: 3, zoneLimit: 499 },
-  R_50:  { name: 'Volatility 50 Index',  dp: 4, zoneLimit: 499 },
   R_75:  { name: 'Volatility 75 Index',  dp: 4, zoneLimit: 499 },
-  R_100: { name: 'Volatility 100 Index', dp: 2, zoneLimit: 49  },
 };
 
 const FIXED_BARRIER = 4;
