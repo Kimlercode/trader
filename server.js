@@ -33,7 +33,6 @@ function sanitizeState() {
 }
 
 // ---------- Markets ----------
-// Removed zoneLimit as we now check the specific 6 to 9 consecutive digits
 const MARKETS = {
   R_10:  { name: 'Volatility 10 Index',  dp: 3 },
   R_25:  { name: 'Volatility 25 Index',  dp: 3 },
@@ -43,7 +42,6 @@ const MARKETS = {
 };
 
 const COOLDOWN_TICKS = 15;
-const SETTLE_TICKS = 5; // Padded for 2-tick duration + API delay
 const WARMUP_TICKS = 1000;
 const TREND_FILTER = true;
 
@@ -113,7 +111,6 @@ class Analyzer {
       zLong[d] = (longFreq[d] - this.longMean[d]) / sl;
     }
 
-    // Mathematical logic left completely untouched as requested
     let overConf = 0;
     if (zShort[0] < 0 && zShort[1] < 0 && zLong[0] < 0 && zLong[1] < 0) {
       const rareShort = Math.min(3, Math.max(0, -Math.min(zShort[0], zShort[1]))) / 3;
@@ -154,15 +151,13 @@ const state = {
 
   marketStates: {},
   realTradeInProgress: false,
-  activeRealTrade: null,
-  settleTicksRemaining: 0,
+  activeRealTrade: null, // Now stores { market, stake, expectedProfit, isBought, tickCount }
 
   marketSignals: {},
   logs: [],
   sessionAlreadyUsedToday: false
 };
 
-// Removed virtual states
 for (const sym of Object.keys(MARKETS)) {
   state.marketStates[sym] = {
     cooldownTicksLeft: 0,
@@ -213,17 +208,17 @@ function loadState() {
 function checkDailyLimits() {
   if (!state.dailyStartBalance) return false;
   
-  // 5% Take Profit and 10% Stop Loss calculation based on initial balance
   const targetProfit = state.dailyStartBalance * 0.05;
   const stopLoss = state.dailyStartBalance * 0.10;
 
-  if (state.dailyPnl >= targetProfit) {
+  // Added -0.001 to handle Javascript floating point inaccuracies safely
+  if (state.dailyPnl >= (targetProfit - 0.001)) {
     state.locked = true;
     state.lockReason = `Daily 5% profit target ($${targetProfit.toFixed(2)}) reached.`;
     addLog(state.lockReason);
     return true;
   }
-  if (state.dailyPnl <= -stopLoss) {
+  if (state.dailyPnl <= -(stopLoss - 0.001)) {
     state.locked = true;
     state.lockReason = `Daily 10% stop-loss ($${stopLoss.toFixed(2)}) hit.`;
     addLog(state.lockReason);
@@ -233,20 +228,28 @@ function checkDailyLimits() {
 }
 
 // ---------- Real trade settlement ----------
-function settleRealTrade() {
-  if (!state.activeRealTrade || state.balance == null) return;
+function settleRealTrade(exitDigit) {
+  if (!state.activeRealTrade) return;
   const trade = state.activeRealTrade;
-  const profit = state.balance - trade.balanceBefore;
-  state.dailyPnl += profit;
-  const result = profit > 0 ? 'WIN' : (profit < 0 ? 'LOSS' : 'DRAW');
-  addLog(`${MARKETS[trade.market].name} REAL ${result}: ${profit.toFixed(2)} | Daily P&L: ${state.dailyPnl.toFixed(2)}`);
-
-  const ms = state.marketStates[trade.market];
+  const marketName = MARKETS[trade.market].name;
   
+  // DIGITUNDER 6: Win if digit is 0, 1, 2, 3, 4, 5
+  const isWin = exitDigit < 6; 
+  const profit = isWin ? trade.expectedProfit : -trade.stake;
+  
+  state.dailyPnl += profit;
+  
+  // Manually update balance for UI instantly. The Deriv API stream will eventually overwrite this to keep it perfectly synced.
+  if (isWin && state.balance != null) {
+      state.balance += (trade.expectedProfit + trade.stake);
+  }
+  
+  const resultStr = isWin ? 'WIN' : 'LOSS';
+  addLog(`${marketName} REAL ${resultStr} (Exit Digit: ${exitDigit}) | PnL: $${profit.toFixed(2)} | Daily PnL: $${state.dailyPnl.toFixed(2)}`);
+
   state.realTradeInProgress = false;
   state.activeRealTrade = null;
-  state.settleTicksRemaining = 0;
-  ms.cooldownTicksLeft = COOLDOWN_TICKS;
+  state.marketStates[trade.market].cooldownTicksLeft = COOLDOWN_TICKS;
   
   checkDailyLimits();
   saveState();
@@ -268,11 +271,17 @@ function processTick(sym, price) {
 
   if (!state.active || state.locked || !state.warmupComplete) return;
 
-  if (state.settleTicksRemaining > 0) {
-    state.settleTicksRemaining--;
-    if (state.settleTicksRemaining === 0) settleRealTrade();
-    broadcastSSE({ state: sanitizeState() });
-    return;
+  // Active Trade Tick Tracking (Digit Verification Method)
+  if (state.realTradeInProgress && state.activeRealTrade && state.activeRealTrade.isBought) {
+    if (sym === state.activeRealTrade.market) {
+        state.activeRealTrade.tickCount++;
+        if (state.activeRealTrade.tickCount === 2) {
+            // This is the exit tick for a 2-tick trade
+            const exitDigit = parseInt(parseFloat(price).toFixed(market.dp).slice(-1));
+            settleRealTrade(exitDigit);
+        }
+    }
+    return; // Block new entries while a trade is in progress
   }
 
   const ms = state.marketStates[sym];
@@ -281,42 +290,46 @@ function processTick(sym, price) {
   
   // 1. Confidence between 70 to 100
   if (!analysis || analysis.overConf < 70 || analysis.overConf > 100) return;
-  
   if (TREND_FILTER && analysis.slope < -0.0001) return;
 
   // 2. Entry condition: Last two consecutive digits are between 6 and 9
   const shortTicks = analyzers[sym].shortTicks;
   if (shortTicks.length < 2) return;
   const lastTwo = shortTicks.slice(-2);
-  
   if (lastTwo[0] < 6 || lastTwo[0] > 9 || lastTwo[1] < 6 || lastTwo[1] > 9) return;
 
-  // 3. Execution: 1% stake, no virtual losses, straight to real
+  // 3. Execution: 1% stake
   state.realTradeInProgress = true;
-  
-  // Stake is exactly 1% of the current account balance (maxed out appropriately so it doesn't fail on tiny accounts if Deriv minimum is $0.35, but math represents 1%)
   let stake = Number((state.balance * 0.01).toFixed(2));
   
-  addLog(`${market.name} REAL entry – stake $${stake.toFixed(2)} (1% of $${state.balance.toFixed(2)})`);
-  state.activeRealTrade = { market: sym, stake, balanceBefore: state.balance };
+  addLog(`${market.name} REAL entry trigger – stake $${stake.toFixed(2)}`);
+  
+  // Initialize trade tracking object
+  state.activeRealTrade = { 
+    market: sym, 
+    stake: stake, 
+    expectedProfit: 0, 
+    isBought: false, 
+    tickCount: 0 
+  };
   
   send({
     proposal: 1, 
     amount: stake, 
     basis: 'stake', 
     currency: state.currency || 'USD',
-    duration: 2,           // 4. Trade Duration 2 Ticks
+    duration: 2,           
     duration_unit: 't', 
     symbol: sym,
-    contract_type: 'DIGITUNDER', // 5. Buy Under
-    barrier: 6,            // Buy Under 6
+    contract_type: 'DIGITUNDER',
+    barrier: 6,            
     req_id: ++reqId
   });
   
   broadcastSSE({ state: sanitizeState() });
 }
 
-// ---------- Deriv WebSocket (legacy token auth) ----------
+// ---------- Deriv WebSocket ----------
 let derivWs = null;
 let reqId = 0;
 
@@ -345,8 +358,9 @@ function handleMessage(msg) {
   if (msg.error) {
     addLog(`Deriv error: ${msg.error.message}`);
     if (state.realTradeInProgress) {
-      state.realTradeInProgress = false; state.activeRealTrade = null; state.settleTicksRemaining = 0;
-      addLog('Trade aborted due to API error – bot will retry on next signal.');
+      state.realTradeInProgress = false; 
+      state.activeRealTrade = null;
+      addLog('Trade aborted due to API error – bot will retry.');
     }
     return;
   }
@@ -379,8 +393,6 @@ function handleMessage(msg) {
         for (const s of Object.keys(MARKETS)) {
           send({ ticks: s, req_id: ++reqId });
         }
-      } else if (state.warmupMarketsRemaining > 0) {
-        addLog(`   Waiting for ${state.warmupMarketsRemaining} more market(s)...`);
       }
       broadcastSSE({ state: sanitizeState() });
     }
@@ -392,11 +404,18 @@ function handleMessage(msg) {
     broadcastSSE({ state: sanitizeState() });
   }
   else if (msg.msg_type === 'proposal') {
-    send({ buy: msg.proposal.id, price: msg.proposal.ask_price, req_id: ++reqId });
+    // Capture the exact payout from Deriv before executing the buy
+    if (state.activeRealTrade && !state.activeRealTrade.isBought) {
+        state.activeRealTrade.expectedProfit = msg.proposal.payout - msg.proposal.ask_price;
+        send({ buy: msg.proposal.id, price: msg.proposal.ask_price, req_id: ++reqId });
+    }
   }
   else if (msg.msg_type === 'buy') {
-    addLog(`Contract bought – ID ${msg.buy.contract_id}`);
-    if (state.activeRealTrade) state.settleTicksRemaining = SETTLE_TICKS;
+    addLog(`Contract bought – tracking 2 ticks for settlement...`);
+    if (state.activeRealTrade) {
+        state.activeRealTrade.isBought = true;
+        state.activeRealTrade.tickCount = 0;
+    }
   }
 }
 
@@ -420,14 +439,14 @@ app.post('/api/control', (req, res) => {
     for (const sym of Object.keys(MARKETS)) {
       state.marketStates[sym] = { cooldownTicksLeft: 0 };
     }
-    state.realTradeInProgress = false; state.activeRealTrade = null; state.settleTicksRemaining = 0;
+    state.realTradeInProgress = false; state.activeRealTrade = null;
     addLog('Bot started – feeding historical ticks for warm‑up...');
     connectDeriv();
     saveState();
   } else if (action === 'stop') {
     state.active = false;
     if (derivWs) derivWs.close();
-    state.realTradeInProgress = false; state.activeRealTrade = null; state.settleTicksRemaining = 0;
+    state.realTradeInProgress = false; state.activeRealTrade = null;
     addLog('Trading stopped.');
     saveState();
   }
