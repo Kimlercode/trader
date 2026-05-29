@@ -48,21 +48,22 @@ const TREND_FILTER = true;
 
 const BASE_STAKE = 0.35;
 const MARTINGALE = 1.5;
-const VIRTUAL_LOSSES_NEEDED = 4;
+const VIRTUAL_LOSSES_NEEDED = 2;          // 2 virtual losses required
 const COOLDOWN_TICKS = 15;
 const DAILY_PROFIT_CAP = 3.00;
 const DAILY_STOP_LOSS = 5.00;
-const SETTLE_TICKS = 15;
+const SETTLE_TICKS = 15;                  // 15‑tick balance settlement
+const WARMUP_TICKS = 1000;                // warm‑up with 1000 ticks per market
 
 // ---------- Analyzer (multi‑market) ----------
 class Analyzer {
   constructor() {
-    this.shortTicks = [];
+    this.shortTicks = [];                  // rolling buffer, max 1000
     this.shortCount = 0;
     this.shortMean = new Array(10).fill(0);
     this.shortM2 = new Array(10).fill(0);
 
-    this.longTicks = [];
+    this.longTicks = [];                   // rolling buffer, max 2000
     this.longCount = 0;
     this.longMean = new Array(10).fill(0);
     this.longM2 = new Array(10).fill(0);
@@ -72,6 +73,8 @@ class Analyzer {
 
   feed(price, dp) {
     const digit = parseInt(parseFloat(price).toFixed(dp).slice(-1));
+
+    // Short‑term buffer (rolling, max 1000)
     this.shortTicks.push(digit);
     if (this.shortTicks.length > 1000) this.shortTicks.shift();
     if (this.shortTicks.length >= 100) {
@@ -86,6 +89,7 @@ class Analyzer {
       }
     }
 
+    // Long‑term buffer (rolling, max 2000)
     this.longTicks.push(digit);
     if (this.longTicks.length > 2000) this.longTicks.shift();
     if (this.longTicks.length >= 500) {
@@ -156,7 +160,8 @@ const state = {
   dailyPnl: 0,
   locked: false,
   lockReason: '',
-  warmupComplete: false,               // ✅ NEW
+  warmupComplete: false,
+  warmupMarketsRemaining: 0,
 
   marketStates: {},
   realTradeInProgress: false,
@@ -294,10 +299,8 @@ function settleRealTrade() {
     addLog(`${MARKETS[trade.market].name} → Back to VIRTUAL (stake reset)`);
   } else if (profit < 0) {
     ms.stake = Math.min(ms.stake * MARTINGALE, state.balance);
-    // stay in real mode – only a win will reset
     addLog(`${MARKETS[trade.market].name} → stays REAL (next stake $${ms.stake.toFixed(2)})`);
   } else {
-    // draw – stay in real mode, stake unchanged
     addLog(`${MARKETS[trade.market].name} → DRAW – stays REAL`);
   }
 
@@ -327,7 +330,7 @@ function processTick(sym, price) {
 
   if (!state.active || state.locked) return;
 
-  // ✅ Warm‑up gate
+  // Warm‑up gate
   if (!state.warmupComplete) return;
 
   // 1. Settlement countdown
@@ -412,11 +415,12 @@ function handleMessage(msg) {
   }
 
   if (msg.msg_type === 'authorize') {
-    addLog('Authorized. Subscribing to balance & all ticks.');
+    addLog('Authorized. Requesting history for warm‑up...');
     send({ balance: 1, subscribe: 1, req_id: ++reqId });
-    // Request history for warm‑up
+    state.warmupMarketsRemaining = Object.keys(MARKETS).length;
+    state.warmupComplete = false;
     for (const sym of Object.keys(MARKETS)) {
-      send({ ticks_history: sym, count: 500, end: 'latest', req_id: ++reqId });
+      send({ ticks_history: sym, count: WARMUP_TICKS, end: 'latest', req_id: ++reqId });
     }
   }
   else if (msg.msg_type === 'balance') {
@@ -430,16 +434,16 @@ function handleMessage(msg) {
     if (analyzer && msg.history && msg.history.prices) {
       addLog(`Warming up ${MARKETS[sym].name} (${msg.history.prices.length} ticks)...`);
       for (const p of msg.history.prices) analyzer.feed(p, MARKETS[sym].dp);
-      send({ ticks: sym, req_id: ++reqId });
-    }
-    // Check if all analyzers are now warm
-    let allWarm = true;
-    for (const s of Object.keys(MARKETS)) {
-      if (!analyzers[s].getAnalysis()) { allWarm = false; break; }
-    }
-    if (allWarm && !state.warmupComplete) {
-      state.warmupComplete = true;
-      addLog('✅ All markets warmed up – trading now live.');
+      state.warmupMarketsRemaining--;
+      if (state.warmupMarketsRemaining <= 0) {
+        state.warmupComplete = true;
+        addLog('✅ All markets warmed up – subscribing to live ticks.');
+        for (const s of Object.keys(MARKETS)) {
+          send({ ticks: s, req_id: ++reqId });
+        }
+      } else {
+        addLog(`   Waiting for ${state.warmupMarketsRemaining} more market(s)...`);
+      }
       broadcastSSE({ state: sanitizeState() });
     }
   }
@@ -465,7 +469,9 @@ app.get('/api/logs', (req, res) => {
   res.write(`data: ${JSON.stringify({ state: sanitizeState() })}\n\n`);
   req.on('close', () => sseClients.delete(res));
 });
+
 app.get('/api/state', (req, res) => res.json({ ...state, logs: undefined }));
+
 app.post('/api/control', (req, res) => {
   const { action } = req.body;
   if (action === 'start') {
@@ -481,7 +487,6 @@ app.post('/api/control', (req, res) => {
     }
     state.realTradeInProgress = false; state.activeRealTrade = null; state.settleTicksRemaining = 0;
     addLog('Bot started – feeding historical ticks for warm‑up...');
-    // Re‑connect will automatically request history
     connectDeriv();
     saveState();
   } else if (action === 'stop') {
