@@ -48,22 +48,22 @@ const TREND_FILTER = true;
 
 const BASE_STAKE = 0.35;
 const MARTINGALE = 1.5;
-const VIRTUAL_LOSSES_NEEDED = 2;          // 2 virtual losses required
+const VIRTUAL_LOSSES_NEEDED = 2;
 const COOLDOWN_TICKS = 15;
 const DAILY_PROFIT_CAP = 3.00;
 const DAILY_STOP_LOSS = 5.00;
-const SETTLE_TICKS = 15;                  // 15‑tick balance settlement
-const WARMUP_TICKS = 1000;                // warm‑up with 1000 ticks per market
+const SETTLE_TICKS = 15;
+const WARMUP_TICKS = 1000;
 
 // ---------- Analyzer (multi‑market) ----------
 class Analyzer {
   constructor() {
-    this.shortTicks = [];                  // rolling buffer, max 1000
+    this.shortTicks = [];
     this.shortCount = 0;
     this.shortMean = new Array(10).fill(0);
     this.shortM2 = new Array(10).fill(0);
 
-    this.longTicks = [];                   // rolling buffer, max 2000
+    this.longTicks = [];
     this.longCount = 0;
     this.longMean = new Array(10).fill(0);
     this.longM2 = new Array(10).fill(0);
@@ -73,8 +73,6 @@ class Analyzer {
 
   feed(price, dp) {
     const digit = parseInt(parseFloat(price).toFixed(dp).slice(-1));
-
-    // Short‑term buffer (rolling, max 1000)
     this.shortTicks.push(digit);
     if (this.shortTicks.length > 1000) this.shortTicks.shift();
     if (this.shortTicks.length >= 100) {
@@ -88,8 +86,6 @@ class Analyzer {
         this.shortM2[d] += delta * (freq[d] - this.shortMean[d]);
       }
     }
-
-    // Long‑term buffer (rolling, max 2000)
     this.longTicks.push(digit);
     if (this.longTicks.length > 2000) this.longTicks.shift();
     if (this.longTicks.length >= 500) {
@@ -103,7 +99,6 @@ class Analyzer {
         this.longM2[d] += delta * (freq[d] - this.longMean[d]);
       }
     }
-
     this.prices.push(price);
     if (this.prices.length > 500) this.prices.shift();
   }
@@ -162,6 +157,7 @@ const state = {
   lockReason: '',
   warmupComplete: false,
   warmupMarketsRemaining: 0,
+  liveSubscribed: false,
 
   marketStates: {},
   realTradeInProgress: false,
@@ -218,11 +214,6 @@ function loadState() {
           state.locked = true;
           state.lockReason = saved.lockReason || '';
         }
-        if (saved.marketStates) {
-          for (const sym of Object.keys(MARKETS)) {
-            if (saved.marketStates[sym]) state.marketStates[sym] = saved.marketStates[sym];
-          }
-        }
       }
     }
   } catch(e) {}
@@ -258,15 +249,13 @@ function inZone(price, dp, limit) {
   }
 }
 
-// ---------- Virtual outcome resolution ----------
+// ---------- Virtual outcome ----------
 function resolveVirtualOutcome(sym, currentPrice) {
   const ms = state.marketStates[sym];
   if (!ms.waitingForOutcome) return;
   ms.waitingForOutcome = false;
-
   const lastDigit = parseInt(parseFloat(currentPrice).toFixed(MARKETS[sym].dp).slice(-1));
   const win = lastDigit > FIXED_BARRIER;
-
   if (win) {
     ms.virtualLosses = 0;
     addLog(`${MARKETS[sym].name} VIRTUAL WIN – losses reset`);
@@ -281,7 +270,7 @@ function resolveVirtualOutcome(sym, currentPrice) {
   ms.cooldownTicksLeft = COOLDOWN_TICKS;
 }
 
-// ---------- Real trade settlement (retreat ONLY on a win) ----------
+// ---------- Real trade settlement ----------
 function settleRealTrade() {
   if (!state.activeRealTrade || state.balance == null) return;
   const trade = state.activeRealTrade;
@@ -291,7 +280,6 @@ function settleRealTrade() {
   addLog(`${MARKETS[trade.market].name} REAL ${result}: ${profit.toFixed(2)} | Daily P&L: ${state.dailyPnl.toFixed(2)}`);
 
   const ms = state.marketStates[trade.market];
-
   if (profit > 0) {
     ms.stake = BASE_STAKE;
     ms.mode = 'virtual';
@@ -308,7 +296,6 @@ function settleRealTrade() {
   state.activeRealTrade = null;
   state.settleTicksRemaining = 0;
   ms.cooldownTicksLeft = COOLDOWN_TICKS;
-
   checkDailyLimits();
   saveState();
   broadcastSSE({ state: sanitizeState() });
@@ -317,23 +304,16 @@ function settleRealTrade() {
 // ---------- Tick processing ----------
 function processTick(sym, price) {
   const market = MARKETS[sym];
-  const analyzer = analyzers[sym];
-  analyzer.feed(price, market.dp);
-
-  const analysis = analyzer.getAnalysis();
+  analyzers[sym].feed(price, market.dp);
+  const analysis = analyzers[sym].getAnalysis();
   if (analysis) {
     state.marketSignals[sym] = {
       overConf: analysis.overConf.toFixed(1),
       trend: analysis.slope > 0.0001 ? 'up' : (analysis.slope < -0.0001 ? 'down' : 'flat')
     };
   }
+  if (!state.active || state.locked || !state.warmupComplete) return;
 
-  if (!state.active || state.locked) return;
-
-  // Warm‑up gate
-  if (!state.warmupComplete) return;
-
-  // 1. Settlement countdown
   if (state.settleTicksRemaining > 0) {
     state.settleTicksRemaining--;
     if (state.settleTicksRemaining === 0) settleRealTrade();
@@ -342,21 +322,9 @@ function processTick(sym, price) {
   }
 
   const ms = state.marketStates[sym];
-
-  // 2. Resolve pending virtual outcome
-  if (ms.waitingForOutcome) {
-    resolveVirtualOutcome(sym, price);
-    broadcastSSE({ state: sanitizeState() });
-    return;
-  }
-
-  // 3. Cooldown
+  if (ms.waitingForOutcome) { resolveVirtualOutcome(sym, price); broadcastSSE({ state: sanitizeState() }); return; }
   if (ms.cooldownTicksLeft > 0) { ms.cooldownTicksLeft--; return; }
-
-  // 4. Global lock
   if (state.realTradeInProgress) return;
-
-  // 5. Signal checks
   if (!analysis || analysis.overConf < MIN_CONFIDENCE) return;
   if (!inZone(price, market.dp, market.zoneLimit)) return;
   if (TREND_FILTER && analysis.slope < -0.0001) return;
@@ -368,14 +336,12 @@ function processTick(sym, price) {
     state.realTradeInProgress = true;
     const rawStake = Math.min(ms.stake, state.balance);
     const stake = Math.round(rawStake * 100) / 100;
-    const contractType = 'DIGITOVER';
     addLog(`${market.name} REAL entry – stake ${stake.toFixed(2)}`);
-
     state.activeRealTrade = { market: sym, stake, balanceBefore: state.balance };
     send({
       proposal: 1, amount: stake, basis: 'stake', currency: state.currency || 'USD',
-      duration: 1, duration_unit: 't', symbol: sym, contract_type: contractType,
-      barrier: FIXED_BARRIER, req_id: ++reqId
+      duration: 1, duration_unit: 't', symbol: sym,
+      contract_type: 'DIGITOVER', barrier: FIXED_BARRIER, req_id: ++reqId
     });
   }
   broadcastSSE({ state: sanitizeState() });
@@ -390,6 +356,7 @@ function send(msg) {
 }
 
 function connectDeriv() {
+  if (!state.active) return;   // ✅ respect Stop
   if (derivWs) derivWs.close();
   const appId = process.env.DERIV_APP_ID;
   derivWs = new WebSocket(`wss://ws.binaryws.com/websockets/v3?app_id=${appId}`);
@@ -398,7 +365,10 @@ function connectDeriv() {
     send({ authorize: process.env.DERIV_API_TOKEN });
   });
   derivWs.on('message', data => { try { handleMessage(JSON.parse(data)); } catch(e) {} });
-  derivWs.on('close', () => setTimeout(connectDeriv, 5000));
+  derivWs.on('close', () => {
+    addLog('WebSocket closed.');
+    if (state.active) setTimeout(connectDeriv, 5000);   // reconnect only if still active
+  });
   derivWs.on('error', err => addLog(`WebSocket error: ${err.message}`));
 }
 
@@ -406,9 +376,7 @@ function handleMessage(msg) {
   if (msg.error) {
     addLog(`Deriv error: ${msg.error.message}`);
     if (state.realTradeInProgress) {
-      state.realTradeInProgress = false;
-      state.activeRealTrade = null;
-      state.settleTicksRemaining = 0;
+      state.realTradeInProgress = false; state.activeRealTrade = null; state.settleTicksRemaining = 0;
       addLog('Trade aborted due to API error – bot will retry on next signal.');
     }
     return;
@@ -419,6 +387,7 @@ function handleMessage(msg) {
     send({ balance: 1, subscribe: 1, req_id: ++reqId });
     state.warmupMarketsRemaining = Object.keys(MARKETS).length;
     state.warmupComplete = false;
+    state.liveSubscribed = false;
     for (const sym of Object.keys(MARKETS)) {
       send({ ticks_history: sym, count: WARMUP_TICKS, end: 'latest', req_id: ++reqId });
     }
@@ -430,18 +399,18 @@ function handleMessage(msg) {
   }
   else if (msg.msg_type === 'history') {
     const sym = msg.echo_req.ticks_history;
-    const analyzer = analyzers[sym];
-    if (analyzer && msg.history && msg.history.prices) {
+    if (analyzers[sym] && msg.history && msg.history.prices) {
       addLog(`Warming up ${MARKETS[sym].name} (${msg.history.prices.length} ticks)...`);
-      for (const p of msg.history.prices) analyzer.feed(p, MARKETS[sym].dp);
+      for (const p of msg.history.prices) analyzers[sym].feed(p, MARKETS[sym].dp);
       state.warmupMarketsRemaining--;
-      if (state.warmupMarketsRemaining <= 0) {
+      if (state.warmupMarketsRemaining <= 0 && !state.liveSubscribed) {
         state.warmupComplete = true;
+        state.liveSubscribed = true;
         addLog('✅ All markets warmed up – subscribing to live ticks.');
         for (const s of Object.keys(MARKETS)) {
           send({ ticks: s, req_id: ++reqId });
         }
-      } else {
+      } else if (state.warmupMarketsRemaining > 0) {
         addLog(`   Waiting for ${state.warmupMarketsRemaining} more market(s)...`);
       }
       broadcastSSE({ state: sanitizeState() });
@@ -478,7 +447,7 @@ app.post('/api/control', (req, res) => {
     if (state.sessionAlreadyUsedToday) return res.status(403).json({ error: 'Session already used today.' });
     state.active = true; state.locked = false;
     state.dailyStartBalance = state.balance; state.dailyPnl = 0; state.lockReason = '';
-    state.warmupComplete = false;
+    state.warmupComplete = false; state.liveSubscribed = false;
     for (const sym of Object.keys(MARKETS)) {
       state.marketStates[sym] = {
         mode: 'virtual', virtualLosses: 0, stake: BASE_STAKE,
@@ -491,6 +460,7 @@ app.post('/api/control', (req, res) => {
     saveState();
   } else if (action === 'stop') {
     state.active = false;
+    if (derivWs) derivWs.close();
     state.realTradeInProgress = false; state.activeRealTrade = null; state.settleTicksRemaining = 0;
     addLog('Trading stopped.');
     saveState();
@@ -499,5 +469,4 @@ app.post('/api/control', (req, res) => {
 });
 
 loadState();
-connectDeriv();
 server.listen(PORT, () => console.log(`Multi-market VL bot on port ${PORT}`));
