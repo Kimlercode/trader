@@ -32,115 +32,71 @@ function sanitizeState() {
   return rest;
 }
 
-// ---------- Market ----------
+// ---------- Under-6 Institutional Configuration ----------
 const MARKET = { sym: 'R_75', name: 'Volatility 75 Index', dp: 4 };
-const FIXED_BARRIER = 5;
-const MIN_CONFIDENCE = 100;
-const DIGIT_SUM_TARGET = 23;
-const HOUSE_EDGE = 0.98;
-const TREND_FILTER = true;
+const FIXED_BARRIER = 6;         // Fixed to 6 (Wins on 0, 1, 2, 3, 4, 5)
 
-const BASE_STAKE = 0.35;
-const MARTINGALE = 1.5;
-const COOLDOWN_TICKS = 15;
+// The Edge Core: Trade only when losing digits (6-9) heavily saturate the feed
+const EXHAUSTION_Z_SCORE = 2.00; // Requires > 2.0 Standard Deviations of imbalance
+const MIN_STREAK = 4;            // Must see at least 4 consecutive losing digits (6-9)
+
+const BASE_STAKE = 0.35;         // Strict flat stake allocation
+const COOLDOWN_TICKS = 25;       
 const SETTLE_TICKS = 15;
-const WARMUP_TICKS = 500;
+const WARMUP_TICKS = 300;
 
-const TP_PERCENT = 5;
-const SL_PERCENT = 10;
+const TP_PERCENT = 10;
+const SL_PERCENT = 20;
 
-// ---------- Analyzer ----------
-class Analyzer {
-  constructor(dp) {
-    this.dp = dp;
-    this.shortTicks = [];
-    this.shortCount = 0;
-    this.shortMean = new Array(10).fill(0);
-    this.shortM2 = new Array(10).fill(0);
+let globalTickCounter = 0;
 
-    this.longTicks = [];
-    this.longCount = 0;
-    this.longMean = new Array(10).fill(0);
-    this.longM2 = new Array(10).fill(0);
-
-    this.prices = [];
+// ---------- Statistical Exhaustion Analyzer ----------
+class StatisticalExhaustionEngine {
+  constructor() {
+    this.ticks = [];
+    this.consecutiveLossDigits = 0;
   }
 
   feed(price) {
-    const digit = parseInt(parseFloat(price).toFixed(this.dp).slice(-1));
-    this.shortTicks.push(digit);
-    if (this.shortTicks.length > 1000) this.shortTicks.shift();
-    if (this.shortTicks.length >= 100) {
-      const recent = this.shortTicks.slice(-100);
-      const freq = {};
-      for (let d = 0; d < 10; d++) freq[d] = recent.filter(x => x === d).length / 100;
-      this.shortCount++;
-      for (let d = 0; d < 10; d++) {
-        const delta = freq[d] - this.shortMean[d];
-        this.shortMean[d] += delta / this.shortCount;
-        this.shortM2[d] += delta * (freq[d] - this.shortMean[d]);
-      }
-    }
+    const digit = parseInt(parseFloat(price).toFixed(MARKET.dp).slice(-1));
+    this.ticks.push(digit);
+    if (this.ticks.length > 400) this.ticks.shift();
 
-    this.longTicks.push(digit);
-    if (this.longTicks.length > 2000) this.longTicks.shift();
-    if (this.longTicks.length >= 500) {
-      const recent = this.longTicks.slice(-500);
-      const freq = {};
-      for (let d = 0; d < 10; d++) freq[d] = recent.filter(x => x === d).length / 500;
-      this.longCount++;
-      for (let d = 0; d < 10; d++) {
-        const delta = freq[d] - this.longMean[d];
-        this.longMean[d] += delta / this.longCount;
-        this.longM2[d] += delta * (freq[d] - this.longMean[d]);
-      }
+    // Track streaks of losing digits (6, 7, 8, 9)
+    if (digit >= 6) {
+      this.consecutiveLossDigits++;
+    } else {
+      this.consecutiveLossDigits = 0;
     }
-
-    this.prices.push(price);
-    if (this.prices.length > 500) this.prices.shift();
   }
 
-  getAnalysis() {
-    if (this.shortCount < 5 || this.longCount < 2) return null;
-    const shortRecent = this.shortTicks.slice(-100);
-    const shortFreq = {};
-    for (let d = 0; d < 10; d++) shortFreq[d] = shortRecent.filter(x => x === d).length / 100;
+  getMetrics() {
+    if (this.ticks.length < WARMUP_TICKS) return null;
 
-    const longRecent = this.longTicks.slice(-500);
-    const longFreq = {};
-    for (let d = 0; d < 10; d++) longFreq[d] = longRecent.filter(x => x === d).length / 500;
+    const shortWindow = this.ticks.slice(-30);
+    const longWindow = this.ticks.slice(-300);
 
-    const zShort = {}, zLong = {};
-    for (let d = 0; d < 10; d++) {
-      const vs = this.shortM2[d] / (this.shortCount - 1), ss = Math.sqrt(vs) || 0.01;
-      zShort[d] = (shortFreq[d] - this.shortMean[d]) / ss;
-      const vl = this.longM2[d] / (this.longCount - 1), sl = Math.sqrt(vl) || 0.01;
-      zLong[d] = (longFreq[d] - this.longMean[d]) / sl;
-    }
+    // Dynamic historical baseline tracking for digits 6-9 (~40% expected)
+    const longLossDigits = longWindow.filter(d => d >= 6).length;
+    const pBaseline = longLossDigits / longWindow.length; 
 
-    let underConf = 0;
-    if (zShort[8] < 0 && zShort[9] < 0 && zLong[8] < 0 && zLong[9] < 0) {
-      const rareShort = Math.min(3, Math.max(0, -Math.min(zShort[8], zShort[9]))) / 3;
-      const rareLong  = Math.min(3, Math.max(0, -Math.min(zLong[8], zLong[9]))) / 3;
-      underConf = (rareShort * 0.4 + rareLong * 0.6 + 0.4) * 100;
-    }
+    const shortLossDigits = shortWindow.filter(d => d >= 6).length;
+    const n = shortWindow.length;
 
-    let slope = 0;
-    if (this.prices.length >= 20) {
-      const rp = this.prices.slice(-20);
-      const n = rp.length;
-      let sx = 0, sy = 0, sxy = 0, sx2 = 0;
-      for (let i = 0; i < n; i++) {
-        sx += i; sy += rp[i]; sxy += i * rp[i]; sx2 += i * i;
-      }
-      slope = (n * sxy - sx * sy) / (n * sx2 - sx * sx);
-    }
+    const expectedLossDigits = n * pBaseline;
+    const standardDeviation = Math.sqrt(n * pBaseline * (1 - pBaseline));
+    
+    const zScore = (shortLossDigits - expectedLossDigits) / (standardDeviation || 1);
 
-    return { underConf, slope };
+    return {
+      zScore: zScore, 
+      currentStreak: this.consecutiveLossDigits,
+      shortDensity: (shortLossDigits / n) * 100
+    };
   }
 }
 
-const analyzer = new Analyzer(MARKET.dp);
+const engine = new StatisticalExhaustionEngine();
 
 // ---------- State ----------
 const state = {
@@ -195,7 +151,7 @@ function loadState() {
       if (saved.date === today && saved.sessionActive) {
         state.sessionAlreadyUsedToday = true;
         state.locked = true;
-        state.lockReason = 'Session already used today.';
+        state.lockReason = 'Daily session safety limits locked.';
         addLog(state.lockReason);
       }
       if (saved.date === today) {
@@ -207,54 +163,35 @@ function loadState() {
   } catch(e) {}
 }
 
-// ---------- Helpers ----------
-function getTP() {
-  return state.dailyStartBalance ? (state.dailyStartBalance * TP_PERCENT / 100) : 0;
-}
-
-function getSL() {
-  return state.dailyStartBalance ? (state.dailyStartBalance * SL_PERCENT / 100) : 0;
-}
+function getTP() { return state.dailyStartBalance ? (state.dailyStartBalance * TP_PERCENT / 100) : 0; }
+function getSL() { return state.dailyStartBalance ? (state.dailyStartBalance * SL_PERCENT / 100) : 0; }
 
 function checkDailyLimits() {
   if (!state.dailyStartBalance) return false;
   if (state.dailyPnl >= getTP()) {
     state.locked = true;
-    state.lockReason = `Take-profit $${getTP().toFixed(2)} (${TP_PERCENT}%) reached.`;
+    state.lockReason = `Target Target-Profit +$${getTP().toFixed(2)} secured.`;
     addLog(state.lockReason);
     return true;
   }
   if (state.dailyPnl <= -getSL()) {
     state.locked = true;
-    state.lockReason = `Stop-loss $${getSL().toFixed(2)} (${SL_PERCENT}%) hit.`;
+    state.lockReason = `Emergency Stop-Loss -$${getSL().toFixed(2)} executed.`;
     addLog(state.lockReason);
     return true;
   }
   return false;
 }
 
-function digitSum(price, dp) {
-  const formatted = parseFloat(price).toFixed(dp);
-  const dec = formatted.split('.')[1] || '';
-  let sum = 0;
-  for (const ch of dec) sum += parseInt(ch);
-  return sum;
-}
-
-// ---------- Real trade settlement ----------
 function settleRealTrade() {
   if (!state.activeRealTrade || state.balance == null) return;
   const profit = state.balance - state.activeRealTrade.balanceBefore;
   state.dailyPnl += profit;
   const result = profit > 0 ? 'WIN' : (profit < 0 ? 'LOSS' : 'DRAW');
-  addLog(`[${state.tradingMode.toUpperCase()}] ${result}: ${profit.toFixed(2)} | Daily P&L: ${state.dailyPnl.toFixed(2)}`);
+  
+  addLog(`[${state.tradingMode.toUpperCase()}] ${result}: ${profit > 0 ? '+' : ''}${profit.toFixed(2)} | Session P&L: ${state.dailyPnl.toFixed(2)}`);
 
-  if (profit > 0) {
-    state.currentStake = BASE_STAKE;
-  } else if (profit < 0) {
-    state.currentStake = Math.min(state.currentStake * MARTINGALE, state.balance);
-  }
-
+  state.currentStake = BASE_STAKE; // Always Flat Stake
   state.tradeInProgress = false;
   state.activeRealTrade = null;
   state.settleTicksRemaining = 0;
@@ -265,11 +202,17 @@ function settleRealTrade() {
   broadcastSSE({ state: sanitizeState() });
 }
 
-// ---------- Tick processing ----------
 function processTick(price) {
-  analyzer.feed(price);
+  engine.feed(price);
+  const metrics = engine.getMetrics();
+  
+  globalTickCounter++;
+  
+  // Dashboard metrics visual heartbeat
+  if (globalTickCounter % 15 === 0 && metrics) {
+    addLog(`📊 Matrix Status: Losing Streak (6-9): [${metrics.currentStreak}] | Risk Density: [${metrics.shortDensity.toFixed(0)}%] | Exhaustion Z-Score: [${metrics.zScore.toFixed(2)} / ${EXHAUSTION_Z_SCORE}]`);
+  }
 
-  const analysis = analyzer.getAnalysis();
   if (!state.active || state.locked || !state.warmupComplete) return;
 
   if (state.settleTicksRemaining > 0) {
@@ -281,27 +224,25 @@ function processTick(price) {
 
   if (state.cooldownTicksLeft > 0) { state.cooldownTicksLeft--; return; }
   if (state.tradeInProgress) return;
+  if (!metrics) return;
 
-  if (!analysis || analysis.underConf < MIN_CONFIDENCE) return;
-  if (digitSum(price, MARKET.dp) <= DIGIT_SUM_TARGET) return;
-  const lastDigit = parseInt(parseFloat(price).toFixed(MARKET.dp).slice(-1));
-  if (lastDigit < 5) return;
-  if (TREND_FILTER && analysis.slope > 0.0001) return;
+  // UNDER 6 HIGH-CONVICTION EXECUTION TARGET
+  if (metrics.zScore >= EXHAUSTION_Z_SCORE && metrics.currentStreak >= MIN_STREAK) {
+    state.tradeInProgress = true;
+    
+    const stake = Math.round(Math.min(BASE_STAKE, state.balance) * 100) / 100;
+    addLog(`🎯 EXHAUSTION DETECTED! Losing numbers cluster over-extended (Streak: ${metrics.currentStreak}, Z-Score: ${metrics.zScore.toFixed(2)}). Order: DIGITUNDER 6`);
 
-  state.tradeInProgress = true;
-  const rawStake = Math.min(state.currentStake, state.balance);
-  const stake = Math.round(rawStake * 100) / 100;
-  addLog(`[${state.tradingMode.toUpperCase()}] Entry – stake $${stake.toFixed(2)} (conf ${analysis.underConf.toFixed(1)}%, sum ${digitSum(price, MARKET.dp)})`);
+    state.activeRealTrade = { stake, balanceBefore: state.balance };
+    
+    send({
+      proposal: 1, amount: stake, basis: 'stake', currency: state.currency || 'USD',
+      duration: 1, duration_unit: 't', symbol: MARKET.sym,
+      contract_type: 'DIGITUNDER', barrier: FIXED_BARRIER, req_id: ++reqId
+    });
 
-  state.activeRealTrade = { stake, balanceBefore: state.balance };
-  
-  send({
-    proposal: 1, amount: stake, basis: 'stake', currency: state.currency || 'USD',
-    duration: 1, duration_unit: 't', symbol: MARKET.sym,
-    contract_type: 'DIGITUNDER', barrier: FIXED_BARRIER, req_id: ++reqId
-  });
-
-  broadcastSSE({ state: sanitizeState() });
+    broadcastSSE({ state: sanitizeState() });
+  }
 }
 
 // ---------- WebSocket & REST Core Setup ----------
@@ -319,140 +260,89 @@ async function connectDeriv() {
   const token = (process.env.DERIV_PAT || '').trim();
 
   if (!appId || !token) {
-    addLog('Connection error: Missing configurations inside Render environment.');
+    addLog('Configuration error: Check Render environment strings.');
     return;
   }
 
   try {
-    addLog(`Step 1/3: Fetching profiles via REST (Targeting: ${state.tradingMode.toUpperCase()})...`);
-    
     const accountsResponse = await fetch('https://api.derivws.com/trading/v1/options/accounts', {
       method: 'GET',
-      headers: {
-        'Deriv-App-ID': appId,
-        'Authorization': `Bearer ${token}`,
-        'Content-Type': 'application/json'
-      }
+      headers: { 'Authorization': `Bearer ${token}`, 'Deriv-App-ID': appId, 'Content-Type': 'application/json' }
     });
 
-    if (!accountsResponse.ok) {
-      const rawText = await accountsResponse.text().catch(() => 'No text content');
-      throw new Error(`Profile rejected: Status ${accountsResponse.status} (${rawText})`);
-    }
+    if (!accountsResponse.ok) throw new Error('API Profile access denied.');
 
     const accountsData = await accountsResponse.json();
     const accountList = Array.isArray(accountsData.data) ? accountsData.data : [accountsData.data];
+    const account = accountList.find(acc => acc.account_type === (state.tradingMode || 'demo'));
     
-    const targetMode = state.tradingMode || 'demo';
-    const account = accountList.find(acc => acc.account_type === targetMode);
-    
-    if (!account) {
-      throw new Error(`Could not find a valid "${targetMode}" account profile under this token.`);
-    }
+    if (!account) throw new Error(`Target account configuration mismatch.`);
 
     const accountId = account.account_id;
-    state.accountType = account.account_type === 'demo' ? '🧪 DEMO / VIRTUAL' : '⚠️ LIVE / REAL ACCOUNT';
+    state.accountType = account.account_type === 'demo' ? '🧪 DEMO PIPELINE' : '⚠️ LIVE PRODUCTION PORTFOLIO';
     state.balance = parseFloat(account.balance);
     state.currency = account.currency || 'USD';
     
-    if (state.dailyStartBalance === null) {
-      state.dailyStartBalance = state.balance;
-    }
+    if (state.dailyStartBalance === null) state.dailyStartBalance = state.balance;
 
-    addLog(`✅ Connected profile located: ${accountId} (${state.accountType})`);
-    addLog('Step 2/3: Generating secure one-time session password (OTP)...');
+    addLog(`✅ Secure Routing Active: ${accountId} (${state.accountType})`);
 
     const otpResponse = await fetch(`https://api.derivws.com/trading/v1/options/accounts/${accountId}/otp`, {
       method: 'POST',
-      headers: {
-        'Deriv-App-ID': appId,
-        'Authorization': `Bearer ${token}`,
-        'Content-Type': 'application/json'
-      }
+      headers: { 'Authorization': `Bearer ${token}`, 'Deriv-App-ID': appId, 'Content-Type': 'application/json' }
     });
 
-    if (!otpResponse.ok) {
-      throw new Error('Deriv security system declined session token assignment.');
-    }
+    if (!otpResponse.ok) throw new Error('Security core refused session allocation.');
 
     const otpData = await otpResponse.json();
-    const preAuthenticatedWsUrl = otpData.data.url;
-
-    addLog('Step 3/3: Spawning protocol-level pre-authenticated stream...');
-    derivWs = new WebSocket(preAuthenticatedWsUrl);
+    derivWs = new WebSocket(otpData.data.url);
 
     derivWs.on('open', () => {
-      addLog(`✅ Real-time pipeline active! Spawning asset subscription routines.`);
+      addLog(`Syncing historical feed arrays...`);
       send({ balance: 1, subscribe: 1, req_id: ++reqId });
       send({ ticks_history: MARKET.sym, count: WARMUP_TICKS, end: 'latest', req_id: ++reqId });
     });
 
-    derivWs.on('message', data => { 
-      try { 
-        handleMessage(JSON.parse(data)); 
-      } catch(e) {} 
-    });
-    
-    derivWs.on('close', () => {
-      addLog('WebSocket session closed.');
-      if (state.active) setTimeout(connectDeriv, 5000);
-    });
-    
-    derivWs.on('error', err => addLog(`Stream error: ${err.message}`));
+    derivWs.on('message', data => { try { handleMessage(JSON.parse(data)); } catch(e) {} });
+    derivWs.on('close', () => { if (state.active) setTimeout(connectDeriv, 5000); });
   } catch (e) {
-    addLog(`Initialization blocked: ${e.message}. Re-attempting in 10s...`);
+    addLog(`Pipeline Error: ${e.message}. Retrying...`);
     if (state.active) setTimeout(connectDeriv, 10000);
   }
 }
 
 function handleMessage(msg) {
   if (msg.error) {
-    addLog(`Deriv error: ${msg.error.message}`);
-    if (state.tradeInProgress) {
-      state.tradeInProgress = false; state.activeRealTrade = null; state.settleTicksRemaining = 0;
-      addLog('Trade aborted due to API error – bot will retry on next signal.');
-    }
+    addLog(`Deriv API Flag: ${msg.error.message}`);
+    state.tradeInProgress = false; state.activeRealTrade = null; state.settleTicksRemaining = 0;
     return;
   }
-
   if (msg.msg_type === 'balance') {
     state.balance = parseFloat(msg.balance.balance);
-    state.currency = msg.balance.currency;
     broadcastSSE({ state: sanitizeState() });
-  }
-  else if (msg.msg_type === 'history') {
-    if (msg.history && msg.history.prices) {
-      state.warmupTicksFed += msg.history.prices.length;
-      addLog(`Warming up (${state.warmupTicksFed} / ${WARMUP_TICKS} ticks)...`);
-      for (const p of msg.history.prices) analyzer.feed(p);
-      if (state.warmupTicksFed >= WARMUP_TICKS && !state.liveSubscribed) {
-        state.warmupComplete = true;
-        state.liveSubscribed = true;
-        addLog('✅ Warm‑up complete – subscribing to live ticks.');
-        send({ ticks: MARKET.sym, req_id: ++reqId });
-      }
-      broadcastSSE({ state: sanitizeState() });
+  } else if (msg.msg_type === 'history') {
+    state.warmupTicksFed += msg.history.prices.length;
+    for (const p of msg.history.prices) engine.feed(p);
+    if (state.warmupTicksFed >= WARMUP_TICKS && !state.liveSubscribed) {
+      state.warmupComplete = true; state.liveSubscribed = true;
+      addLog('✅ Baseline calibrated. High-probability Under-6 strategy armed.');
+      send({ ticks: MARKET.sym, req_id: ++reqId });
     }
-  }
-  else if (msg.msg_type === 'tick') {
+    broadcastSSE({ state: sanitizeState() });
+  } else if (msg.msg_type === 'tick') {
     if (msg.tick.symbol !== MARKET.sym) return;
     processTick(parseFloat(msg.tick.quote));
     broadcastSSE({ state: sanitizeState() });
-  }
-  else if (msg.msg_type === 'proposal') {
+  } else if (msg.msg_type === 'proposal') {
     send({ buy: msg.proposal.id, price: msg.proposal.ask_price, req_id: ++reqId });
-  }
-  else if (msg.msg_type === 'buy') {
-    addLog(`Contract bought – ID ${msg.buy.contract_id}`);
+  } else if (msg.msg_type === 'buy') {
     if (state.activeRealTrade) state.settleTicksRemaining = SETTLE_TICKS;
   }
 }
 
-// ---------- API ----------
 app.get('/api/logs', (req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
-  res.write('\n'); sseClients.add(res);
-  res.write(`data: ${JSON.stringify({ state: sanitizeState() })}\n\n`);
+  sseClients.add(res); res.write(`data: ${JSON.stringify({ state: sanitizeState() })}\n\n`);
   req.on('close', () => sseClients.delete(res));
 });
 
@@ -460,42 +350,24 @@ app.get('/api/state', (req, res) => res.json({ ...state, logs: undefined }));
 
 app.post('/api/control', (req, res) => {
   const { action, mode } = req.body;
-  
   if (action === 'set_mode') {
-    if (state.active) {
-      return res.status(400).json({ error: 'Cannot change account types while trading is active.' });
-    }
-    if (mode === 'demo' || mode === 'real') {
-      state.tradingMode = mode;
-      state.dailyStartBalance = null; 
-      state.dailyPnl = 0;
-      addLog(`⚙️ Mode switched from web interface to: ${mode.toUpperCase()}`);
-      saveState();
-      broadcastSSE({ state: sanitizeState() });
-      return res.json({ success: true, mode: state.tradingMode });
-    }
-    return res.status(400).json({ error: 'Invalid mode selection.' });
+    if (state.active) return res.status(400).json({ error: 'System processing core active.' });
+    state.tradingMode = mode; state.dailyStartBalance = null; state.dailyPnl = 0;
+    saveState(); broadcastSSE({ state: sanitizeState() }); return res.json({ success: true });
   }
-
   if (action === 'start') {
-    if (state.sessionAlreadyUsedToday) return res.status(403).json({ error: 'Session already used today.' });
-    state.active = true; state.locked = false;
-    state.dailyStartBalance = null; state.dailyPnl = 0; state.lockReason = '';
+    if (state.sessionAlreadyUsedToday) return res.status(403).json({ error: 'Session locked.' });
+    state.active = true; state.locked = false; state.dailyStartBalance = null; state.dailyPnl = 0;
     state.warmupComplete = false; state.warmupTicksFed = 0; state.liveSubscribed = false;
-    state.currentStake = BASE_STAKE; state.cooldownTicksLeft = 0;
     state.tradeInProgress = false; state.activeRealTrade = null; state.settleTicksRemaining = 0;
-    addLog(`Under‑6 bot started on [${state.tradingMode.toUpperCase()}] (TP ${TP_PERCENT}%, SL ${SL_PERCENT}%).`);
-    connectDeriv();
-    saveState();
+    addLog(`🚀 Core Initiated. Target Vector: [UNDER 6] Mode: [${state.tradingMode.toUpperCase()}].`);
+    connectDeriv(); saveState();
   } else if (action === 'stop') {
-    state.active = false;
-    if (derivWs) derivWs.close();
-    state.tradeInProgress = false; state.activeRealTrade = null; state.settleTicksRemaining = 0;
-    addLog('Trading stopped.');
-    saveState();
+    state.active = false; if (derivWs) derivWs.close();
+    state.tradeInProgress = false; addLog('Engine returned to standby.'); saveState();
   }
   broadcastSSE({ state: sanitizeState() }); res.json({ success: true });
 });
 
 loadState();
-server.listen(PORT, () => console.log(`Under‑6 PAT bot running on port ${PORT}`));
+server.listen(PORT, () => console.log(`Under-6 Execution Matrix Online on Port ${PORT}`));
