@@ -1,5 +1,6 @@
 const express = require('express');
 const http = require('http');
+const https = require('https');
 const WebSocket = require('ws');
 const path = require('path');
 const fs = require('fs');
@@ -32,22 +33,27 @@ function sanitizeState() {
   return rest;
 }
 
-// ---------- Markets ----------
-const MARKETS = {
-  R_10:  { name: 'Volatility 10 Index',  dp: 3 },
-  R_25:  { name: 'Volatility 25 Index',  dp: 3 },
-  R_50:  { name: 'Volatility 50 Index',  dp: 4 },
-  R_75:  { name: 'Volatility 75 Index',  dp: 4 },
-  R_100: { name: 'Volatility 100 Index', dp: 2 },
-};
-
-const COOLDOWN_TICKS = 15;
-const WARMUP_TICKS = 1000;
+// ---------- Market ----------
+const MARKET = { sym: 'R_75', name: 'Volatility 75 Index', dp: 4 };
+const FIXED_BARRIER = 5;                // DIGITUNDER barrier 5
+const MIN_CONFIDENCE = 100;
+const DIGIT_SUM_TARGET = 23;
+const HOUSE_EDGE = 0.98;
 const TREND_FILTER = true;
 
-// ---------- Analyzer (multi‑market) ----------
+const BASE_STAKE = 0.35;
+const MARTINGALE = 1.5;
+const COOLDOWN_TICKS = 15;
+const SETTLE_TICKS = 15;
+const WARMUP_TICKS = 500;
+
+const TP_PERCENT = 5;                   // 5%
+const SL_PERCENT = 10;                  // 10%
+
+// ---------- Analyzer (z‑score) ----------
 class Analyzer {
-  constructor() {
+  constructor(dp) {
+    this.dp = dp;
     this.shortTicks = [];
     this.shortCount = 0;
     this.shortMean = new Array(10).fill(0);
@@ -61,8 +67,8 @@ class Analyzer {
     this.prices = [];
   }
 
-  feed(price, dp) {
-    const digit = parseInt(parseFloat(price).toFixed(dp).slice(-1));
+  feed(price) {
+    const digit = parseInt(parseFloat(price).toFixed(this.dp).slice(-1));
     this.shortTicks.push(digit);
     if (this.shortTicks.length > 1000) this.shortTicks.shift();
     if (this.shortTicks.length >= 100) {
@@ -76,6 +82,7 @@ class Analyzer {
         this.shortM2[d] += delta * (freq[d] - this.shortMean[d]);
       }
     }
+
     this.longTicks.push(digit);
     if (this.longTicks.length > 2000) this.longTicks.shift();
     if (this.longTicks.length >= 500) {
@@ -89,6 +96,7 @@ class Analyzer {
         this.longM2[d] += delta * (freq[d] - this.longMean[d]);
       }
     }
+
     this.prices.push(price);
     if (this.prices.length > 500) this.prices.shift();
   }
@@ -111,11 +119,11 @@ class Analyzer {
       zLong[d] = (longFreq[d] - this.longMean[d]) / sl;
     }
 
-    let overConf = 0;
-    if (zShort[0] < 0 && zShort[1] < 0 && zLong[0] < 0 && zLong[1] < 0) {
-      const rareShort = Math.min(3, Math.max(0, -Math.min(zShort[0], zShort[1]))) / 3;
-      const rareLong  = Math.min(3, Math.max(0, -Math.min(zLong[0], zLong[1]))) / 3;
-      overConf = (rareShort * 0.4 + rareLong * 0.6 + 0.4) * 100;
+    let underConf = 0;
+    if (zShort[8] < 0 && zShort[9] < 0 && zLong[8] < 0 && zLong[9] < 0) {
+      const rareShort = Math.min(3, Math.max(0, -Math.min(zShort[8], zShort[9]))) / 3;
+      const rareLong  = Math.min(3, Math.max(0, -Math.min(zLong[8], zLong[9]))) / 3;
+      underConf = (rareShort * 0.4 + rareLong * 0.6 + 0.4) * 100;
     }
 
     let slope = 0;
@@ -129,12 +137,11 @@ class Analyzer {
       slope = (n * sxy - sx * sy) / (n * sx2 - sx * sx);
     }
 
-    return { overConf, slope };
+    return { underConf, slope };
   }
 }
 
-const analyzers = {};
-for (const sym of Object.keys(MARKETS)) analyzers[sym] = new Analyzer();
+const analyzer = new Analyzer(MARKET.dp);
 
 // ---------- State ----------
 const state = {
@@ -146,23 +153,18 @@ const state = {
   locked: false,
   lockReason: '',
   warmupComplete: false,
-  warmupMarketsRemaining: 0,
+  warmupTicksFed: 0,
   liveSubscribed: false,
 
-  marketStates: {},
-  realTradeInProgress: false,
-  activeRealTrade: null, // Now stores { market, stake, expectedProfit, isBought, tickCount }
+  tradeInProgress: false,
+  activeRealTrade: null,
+  settleTicksRemaining: 0,
+  currentStake: BASE_STAKE,
+  cooldownTicksLeft: 0,
 
-  marketSignals: {},
   logs: [],
   sessionAlreadyUsedToday: false
 };
-
-for (const sym of Object.keys(MARKETS)) {
-  state.marketStates[sym] = {
-    cooldownTicksLeft: 0,
-  };
-}
 
 // ---------- Persistence ----------
 function saveState() {
@@ -175,8 +177,7 @@ function saveState() {
       dailyPnl: state.dailyPnl,
       locked: state.locked,
       lockReason: state.lockReason,
-      sessionActive: state.active,
-      marketStates: state.marketStates
+      sessionActive: state.active
     }));
   } catch(e) {}
 }
@@ -195,141 +196,109 @@ function loadState() {
       if (saved.date === today) {
         state.dailyStartBalance = saved.dailyStartBalance;
         state.dailyPnl = saved.dailyPnl || 0;
-        if (saved.locked) {
-          state.locked = true;
-          state.lockReason = saved.lockReason || '';
-        }
+        if (saved.locked) { state.locked = true; state.lockReason = saved.lockReason || ''; }
       }
     }
   } catch(e) {}
 }
 
 // ---------- Helpers ----------
+function getTP() {
+  return state.dailyStartBalance ? (state.dailyStartBalance * TP_PERCENT / 100) : 0;
+}
+
+function getSL() {
+  return state.dailyStartBalance ? (state.dailyStartBalance * SL_PERCENT / 100) : 0;
+}
+
 function checkDailyLimits() {
   if (!state.dailyStartBalance) return false;
-  
-  const targetProfit = state.dailyStartBalance * 0.05;
-  const stopLoss = state.dailyStartBalance * 0.10;
-
-  // Added -0.001 to handle Javascript floating point inaccuracies safely
-  if (state.dailyPnl >= (targetProfit - 0.001)) {
+  if (state.dailyPnl >= getTP()) {
     state.locked = true;
-    state.lockReason = `Daily 5% profit target ($${targetProfit.toFixed(2)}) reached.`;
+    state.lockReason = `Take-profit $${getTP().toFixed(2)} (${TP_PERCENT}%) reached.`;
     addLog(state.lockReason);
     return true;
   }
-  if (state.dailyPnl <= -(stopLoss - 0.001)) {
+  if (state.dailyPnl <= -getSL()) {
     state.locked = true;
-    state.lockReason = `Daily 10% stop-loss ($${stopLoss.toFixed(2)}) hit.`;
+    state.lockReason = `Stop-loss $${getSL().toFixed(2)} (${SL_PERCENT}%) hit.`;
     addLog(state.lockReason);
     return true;
   }
   return false;
 }
 
-// ---------- Real trade settlement ----------
-function settleRealTrade(exitDigit) {
-  if (!state.activeRealTrade) return;
-  const trade = state.activeRealTrade;
-  const marketName = MARKETS[trade.market].name;
-  
-  // DIGITUNDER 6: Win if digit is 0, 1, 2, 3, 4, 5
-  const isWin = exitDigit < 6; 
-  const profit = isWin ? trade.expectedProfit : -trade.stake;
-  
-  state.dailyPnl += profit;
-  
-  // Manually update balance for UI instantly. The Deriv API stream will eventually overwrite this to keep it perfectly synced.
-  if (isWin && state.balance != null) {
-      state.balance += (trade.expectedProfit + trade.stake);
-  }
-  
-  const resultStr = isWin ? 'WIN' : 'LOSS';
-  addLog(`${marketName} REAL ${resultStr} (Exit Digit: ${exitDigit}) | PnL: $${profit.toFixed(2)} | Daily PnL: $${state.dailyPnl.toFixed(2)}`);
+function digitSum(price, dp) {
+  const formatted = parseFloat(price).toFixed(dp);
+  const dec = formatted.split('.')[1] || '';
+  let sum = 0;
+  for (const ch of dec) sum += parseInt(ch);
+  return sum;
+}
 
-  state.realTradeInProgress = false;
+// ---------- Real trade settlement ----------
+function settleRealTrade() {
+  if (!state.activeRealTrade || state.balance == null) return;
+  const profit = state.balance - state.activeRealTrade.balanceBefore;
+  state.dailyPnl += profit;
+  const result = profit > 0 ? 'WIN' : (profit < 0 ? 'LOSS' : 'DRAW');
+  addLog(`REAL ${result}: ${profit.toFixed(2)} | Daily P&L: ${state.dailyPnl.toFixed(2)}`);
+
+  if (profit > 0) {
+    state.currentStake = BASE_STAKE;
+  } else if (profit < 0) {
+    state.currentStake = Math.min(state.currentStake * MARTINGALE, state.balance);
+  }
+
+  state.tradeInProgress = false;
   state.activeRealTrade = null;
-  state.marketStates[trade.market].cooldownTicksLeft = COOLDOWN_TICKS;
-  
+  state.settleTicksRemaining = 0;
+  state.cooldownTicksLeft = COOLDOWN_TICKS;
+
   checkDailyLimits();
   saveState();
   broadcastSSE({ state: sanitizeState() });
 }
 
 // ---------- Tick processing ----------
-function processTick(sym, price) {
-  const market = MARKETS[sym];
-  analyzers[sym].feed(price, market.dp);
-  const analysis = analyzers[sym].getAnalysis();
-  
-  if (analysis) {
-    state.marketSignals[sym] = {
-      overConf: analysis.overConf.toFixed(1),
-      trend: analysis.slope > 0.0001 ? 'up' : (analysis.slope < -0.0001 ? 'down' : 'flat')
-    };
-  }
+function processTick(price) {
+  analyzer.feed(price);
 
+  const analysis = analyzer.getAnalysis();
   if (!state.active || state.locked || !state.warmupComplete) return;
 
-  // Active Trade Tick Tracking (Digit Verification Method)
-  if (state.realTradeInProgress && state.activeRealTrade && state.activeRealTrade.isBought) {
-    if (sym === state.activeRealTrade.market) {
-        state.activeRealTrade.tickCount++;
-        if (state.activeRealTrade.tickCount === 2) {
-            // This is the exit tick for a 2-tick trade
-            const exitDigit = parseInt(parseFloat(price).toFixed(market.dp).slice(-1));
-            settleRealTrade(exitDigit);
-        }
-    }
-    return; // Block new entries while a trade is in progress
+  if (state.settleTicksRemaining > 0) {
+    state.settleTicksRemaining--;
+    if (state.settleTicksRemaining === 0) settleRealTrade();
+    broadcastSSE({ state: sanitizeState() });
+    return;
   }
 
-  const ms = state.marketStates[sym];
-  if (ms.cooldownTicksLeft > 0) { ms.cooldownTicksLeft--; return; }
-  if (state.realTradeInProgress) return;
-  
-  // 1. Confidence between 70 to 100
-  if (!analysis || analysis.overConf < 70 || analysis.overConf > 100) return;
-  if (TREND_FILTER && analysis.slope < -0.0001) return;
+  if (state.cooldownTicksLeft > 0) { state.cooldownTicksLeft--; return; }
+  if (state.tradeInProgress) return;
 
-  // 2. Entry condition: Last two consecutive digits are between 6 and 9
-  const shortTicks = analyzers[sym].shortTicks;
-  if (shortTicks.length < 2) return;
-  const lastTwo = shortTicks.slice(-2);
-  if (lastTwo[0] < 6 || lastTwo[0] > 9 || lastTwo[1] < 6 || lastTwo[1] > 9) return;
+  if (!analysis || analysis.underConf < MIN_CONFIDENCE) return;
+  if (digitSum(price, MARKET.dp) <= DIGIT_SUM_TARGET) return;
+  const lastDigit = parseInt(parseFloat(price).toFixed(MARKET.dp).slice(-1));
+  if (lastDigit < 5) return;
+  if (TREND_FILTER && analysis.slope > 0.0001) return;
 
-  // 3. Execution: 1% stake
-  state.realTradeInProgress = true;
-  let stake = Number((state.balance * 0.01).toFixed(2));
-  
-  addLog(`${market.name} REAL entry trigger – stake $${stake.toFixed(2)}`);
-  
-  // Initialize trade tracking object
-  state.activeRealTrade = { 
-    market: sym, 
-    stake: stake, 
-    expectedProfit: 0, 
-    isBought: false, 
-    tickCount: 0 
-  };
-  
+  state.tradeInProgress = true;
+  const rawStake = Math.min(state.currentStake, state.balance);
+  const stake = Math.round(rawStake * 100) / 100;
+  addLog(`REAL entry – stake $${stake.toFixed(2)} (conf ${analysis.underConf.toFixed(1)}%, sum ${digitSum(price, MARKET.dp)})`);
+
+  state.activeRealTrade = { stake, balanceBefore: state.balance };
   send({
-    proposal: 1, 
-    amount: stake, 
-    basis: 'stake', 
-    currency: state.currency || 'USD',
-    duration: 2,           
-    duration_unit: 't', 
-    symbol: sym,
-    contract_type: 'DIGITUNDER',
-    barrier: 6,            
-    req_id: ++reqId
+    proposal: 1, amount: stake, basis: 'stake', currency: state.currency || 'USD',
+    duration: 1, duration_unit: 't', underlying_symbol: MARKET.sym,
+    contract_type: 'DIGITUNDER', barrier: FIXED_BARRIER, req_id: ++reqId
   });
-  
+
   broadcastSSE({ state: sanitizeState() });
 }
 
-// ---------- Deriv WebSocket ----------
+// ---------- WebSocket connection (PAT → OTP) ----------
 let derivWs = null;
 let reqId = 0;
 
@@ -337,85 +306,100 @@ function send(msg) {
   if (derivWs && derivWs.readyState === WebSocket.OPEN) derivWs.send(JSON.stringify(msg));
 }
 
-function connectDeriv() {
+async function fetchOTP() {
+  return new Promise((resolve, reject) => {
+    const appId = process.env.DERIV_APP_ID;
+    const pat = process.env.DERIV_PAT;
+    const accountId = process.env.DERIV_ACCOUNT_ID;
+    if (!appId || !pat || !accountId) return reject(new Error('Missing credentials'));
+    const req = https.request({
+      hostname: 'api.derivws.com',
+      path: `/trading/v1/options/accounts/${accountId}/otp`,
+      method: 'POST',
+      headers: {
+        'Deriv-App-ID': appId,
+        'Authorization': `Bearer ${pat}`,
+        'Content-Type': 'application/json'
+      }
+    }, res => {
+      let body = '';
+      res.on('data', chunk => body += chunk);
+      res.on('end', () => {
+        try {
+          const data = JSON.parse(body);
+          if (data?.data?.url) resolve(data.data.url);
+          else reject(new Error(data?.error?.message || 'No OTP URL'));
+        } catch (e) { reject(e); }
+      });
+    });
+    req.on('error', reject);
+    req.end();
+  });
+}
+
+async function connectDeriv() {
   if (!state.active) return;
-  if (derivWs) derivWs.close();
-  const appId = process.env.DERIV_APP_ID;
-  derivWs = new WebSocket(`wss://ws.binaryws.com/websockets/v3?app_id=${appId}`);
-  derivWs.on('open', () => {
-    addLog('Connected. Authorizing...');
-    send({ authorize: process.env.DERIV_API_TOKEN });
-  });
-  derivWs.on('message', data => { try { handleMessage(JSON.parse(data)); } catch(e) {} });
-  derivWs.on('close', () => {
-    addLog('WebSocket closed.');
-    if (state.active) setTimeout(connectDeriv, 5000);
-  });
-  derivWs.on('error', err => addLog(`WebSocket error: ${err.message}`));
+  try {
+    addLog('Fetching OTP…');
+    const wsUrl = await fetchOTP();
+    derivWs = new WebSocket(wsUrl);
+    derivWs.on('open', () => {
+      addLog('Connected. Requesting warm‑up ticks…');
+      send({ balance: 1, subscribe: 1 });
+      send({ ticks_history: MARKET.sym, count: WARMUP_TICKS, end: 'latest' });
+    });
+    derivWs.on('message', data => { try { handleMessage(JSON.parse(data)); } catch(e) {} });
+    derivWs.on('close', () => {
+      addLog('WebSocket closed.');
+      if (state.active) setTimeout(connectDeriv, 5000);
+    });
+    derivWs.on('error', err => addLog(`WebSocket error: ${err.message}`));
+  } catch (e) {
+    addLog(`Connection error: ${e.message}. Retrying in 10s…`);
+    if (state.active) setTimeout(connectDeriv, 10000);
+  }
 }
 
 function handleMessage(msg) {
   if (msg.error) {
     addLog(`Deriv error: ${msg.error.message}`);
-    if (state.realTradeInProgress) {
-      state.realTradeInProgress = false; 
-      state.activeRealTrade = null;
-      addLog('Trade aborted due to API error – bot will retry.');
+    if (state.tradeInProgress) {
+      state.tradeInProgress = false; state.activeRealTrade = null; state.settleTicksRemaining = 0;
+      addLog('Trade aborted due to API error – bot will retry on next signal.');
     }
     return;
   }
 
-  if (msg.msg_type === 'authorize') {
-    addLog('Authorized. Requesting history for warm‑up...');
-    send({ balance: 1, subscribe: 1, req_id: ++reqId });
-    state.warmupMarketsRemaining = Object.keys(MARKETS).length;
-    state.warmupComplete = false;
-    state.liveSubscribed = false;
-    for (const sym of Object.keys(MARKETS)) {
-      send({ ticks_history: sym, count: WARMUP_TICKS, end: 'latest', req_id: ++reqId });
-    }
-  }
-  else if (msg.msg_type === 'balance') {
+  if (msg.msg_type === 'balance') {
     state.balance = parseFloat(msg.balance.balance);
     state.currency = msg.balance.currency;
     broadcastSSE({ state: sanitizeState() });
   }
   else if (msg.msg_type === 'history') {
-    const sym = msg.echo_req.ticks_history;
-    if (analyzers[sym] && msg.history && msg.history.prices) {
-      addLog(`Warming up ${MARKETS[sym].name} (${msg.history.prices.length} ticks)...`);
-      for (const p of msg.history.prices) analyzers[sym].feed(p, MARKETS[sym].dp);
-      state.warmupMarketsRemaining--;
-      if (state.warmupMarketsRemaining <= 0 && !state.liveSubscribed) {
+    if (msg.history && msg.history.prices) {
+      state.warmupTicksFed += msg.history.prices.length;
+      addLog(`Warming up (${state.warmupTicksFed} / ${WARMUP_TICKS} ticks)...`);
+      for (const p of msg.history.prices) analyzer.feed(p);
+      if (state.warmupTicksFed >= WARMUP_TICKS && !state.liveSubscribed) {
         state.warmupComplete = true;
         state.liveSubscribed = true;
-        addLog('✅ All markets warmed up – subscribing to live ticks.');
-        for (const s of Object.keys(MARKETS)) {
-          send({ ticks: s, req_id: ++reqId });
-        }
+        addLog('✅ Warm‑up complete – subscribing to live ticks.');
+        send({ ticks: MARKET.sym, req_id: ++reqId });
       }
       broadcastSSE({ state: sanitizeState() });
     }
   }
   else if (msg.msg_type === 'tick') {
-    const sym = msg.tick.symbol;
-    if (!MARKETS[sym]) return;
-    processTick(sym, parseFloat(msg.tick.quote));
+    if (msg.tick.symbol !== MARKET.sym) return;
+    processTick(parseFloat(msg.tick.quote));
     broadcastSSE({ state: sanitizeState() });
   }
   else if (msg.msg_type === 'proposal') {
-    // Capture the exact payout from Deriv before executing the buy
-    if (state.activeRealTrade && !state.activeRealTrade.isBought) {
-        state.activeRealTrade.expectedProfit = msg.proposal.payout - msg.proposal.ask_price;
-        send({ buy: msg.proposal.id, price: msg.proposal.ask_price, req_id: ++reqId });
-    }
+    send({ buy: msg.proposal.id, price: msg.proposal.ask_price, req_id: ++reqId });
   }
   else if (msg.msg_type === 'buy') {
-    addLog(`Contract bought – tracking 2 ticks for settlement...`);
-    if (state.activeRealTrade) {
-        state.activeRealTrade.isBought = true;
-        state.activeRealTrade.tickCount = 0;
-    }
+    addLog(`Contract bought – ID ${msg.buy.contract_id}`);
+    if (state.activeRealTrade) state.settleTicksRemaining = SETTLE_TICKS;
   }
 }
 
@@ -435,18 +419,16 @@ app.post('/api/control', (req, res) => {
     if (state.sessionAlreadyUsedToday) return res.status(403).json({ error: 'Session already used today.' });
     state.active = true; state.locked = false;
     state.dailyStartBalance = state.balance; state.dailyPnl = 0; state.lockReason = '';
-    state.warmupComplete = false; state.liveSubscribed = false;
-    for (const sym of Object.keys(MARKETS)) {
-      state.marketStates[sym] = { cooldownTicksLeft: 0 };
-    }
-    state.realTradeInProgress = false; state.activeRealTrade = null;
-    addLog('Bot started – feeding historical ticks for warm‑up...');
+    state.warmupComplete = false; state.warmupTicksFed = 0; state.liveSubscribed = false;
+    state.currentStake = BASE_STAKE; state.cooldownTicksLeft = 0;
+    state.tradeInProgress = false; state.activeRealTrade = null; state.settleTicksRemaining = 0;
+    addLog(`Under‑6 bot started (TP ${TP_PERCENT}%, SL ${SL_PERCENT}%).`);
     connectDeriv();
     saveState();
   } else if (action === 'stop') {
     state.active = false;
     if (derivWs) derivWs.close();
-    state.realTradeInProgress = false; state.activeRealTrade = null;
+    state.tradeInProgress = false; state.activeRealTrade = null; state.settleTicksRemaining = 0;
     addLog('Trading stopped.');
     saveState();
   }
@@ -454,4 +436,4 @@ app.post('/api/control', (req, res) => {
 });
 
 loadState();
-server.listen(PORT, () => console.log(`Multi-market Bot (Under 6) on port ${PORT}`));
+server.listen(PORT, () => console.log(`Under‑6 PAT bot on port ${PORT}`));
