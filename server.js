@@ -310,8 +310,8 @@ function send(msg) {
 async function connectDeriv() {
   if (!state.active) return;
   
-  const appId = process.env.DERIV_APP_ID;
-  const token = process.env.DERIV_PAT;
+  const appId = (process.env.DERIV_APP_ID || '').trim();
+  const token = (process.env.DERIV_PAT || '').trim();
 
   if (!appId || !token) {
     addLog('Connection error: Missing DERIV_APP_ID or DERIV_PAT configurations inside Render environment.');
@@ -331,16 +331,26 @@ async function connectDeriv() {
     });
 
     if (!accountsResponse.ok) {
-      const errBody = await accountsResponse.json().catch(() => ({}));
-      const msg = errBody.errors ? errBody.errors[0].message : 'HTTP Authentication Rejected';
-      throw new Error(`Profile rejected: ${msg}`);
+      const rawText = await accountsResponse.text().catch(() => 'No text content available');
+      console.error(`[CRITICAL DIAGNOSTIC] HTTP Status Code: ${accountsResponse.status}`);
+      console.error(`[CRITICAL DIAGNOSTIC] Raw Response Payload from Deriv: ${rawText}`);
+      
+      let parsedMessage = 'HTTP Authentication Rejected';
+      try {
+        const errObj = JSON.parse(rawText);
+        if (errObj.errors && errObj.errors[0]) {
+          parsedMessage = `${errObj.errors[0].code}: ${errObj.errors[0].message}`;
+        }
+      } catch(e) {}
+      
+      throw new Error(`Profile rejected: Status ${accountsResponse.status} (${parsedMessage})`);
     }
 
     const accountsData = await accountsResponse.json();
     const account = Array.isArray(accountsData.data) ? accountsData.data[0] : accountsData.data;
     
     if (!account || !account.account_id) {
-      throw new Error('No valid Options trading accounts mapped under this token.');
+      throw new Error('No active Options trading accounts found mapped under this token scope.');
     }
 
     const accountId = account.account_id;
@@ -365,6 +375,8 @@ async function connectDeriv() {
     });
 
     if (!otpResponse.ok) {
+      const otpRawErr = await otpResponse.text().catch(() => '');
+      console.error(`[OTP DIAGNOSTIC] HTTP Status: ${otpResponse.status} | Payload: ${otpRawErr}`);
       throw new Error('Deriv security system declined session token assignment.');
     }
 
@@ -376,8 +388,6 @@ async function connectDeriv() {
 
     derivWs.on('open', () => {
       addLog('✅ Real-time pipeline active! Spawning asset subscription routines.');
-      
-      // Request underlying real-time subscriptions immediately
       send({ balance: 1, subscribe: 1, req_id: ++reqId });
       send({ ticks_history: MARKET.sym, count: WARMUP_TICKS, end: 'latest', req_id: ++reqId });
     });
