@@ -145,6 +145,7 @@ const analyzer = new Analyzer(MARKET.dp);
 // ---------- State ----------
 const state = {
   active: false,
+  tradingMode: 'demo', 
   balance: null,
   currency: 'USD',
   dailyStartBalance: null,
@@ -173,6 +174,7 @@ function saveState() {
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(STATE_FILE, JSON.stringify({
       date: new Date().toISOString().slice(0,10),
+      tradingMode: state.tradingMode,
       dailyStartBalance: state.dailyStartBalance,
       dailyPnl: state.dailyPnl,
       locked: state.locked,
@@ -187,6 +189,9 @@ function loadState() {
     if (fs.existsSync(STATE_FILE)) {
       const saved = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
       const today = new Date().toISOString().slice(0,10);
+      
+      if (saved.tradingMode) state.tradingMode = saved.tradingMode;
+      
       if (saved.date === today && saved.sessionActive) {
         state.sessionAlreadyUsedToday = true;
         state.locked = true;
@@ -242,7 +247,7 @@ function settleRealTrade() {
   const profit = state.balance - state.activeRealTrade.balanceBefore;
   state.dailyPnl += profit;
   const result = profit > 0 ? 'WIN' : (profit < 0 ? 'LOSS' : 'DRAW');
-  addLog(`REAL ${result}: ${profit.toFixed(2)} | Daily P&L: ${state.dailyPnl.toFixed(2)}`);
+  addLog(`[${state.tradingMode.toUpperCase()}] ${result}: ${profit.toFixed(2)} | Daily P&L: ${state.dailyPnl.toFixed(2)}`);
 
   if (profit > 0) {
     state.currentStake = BASE_STAKE;
@@ -286,7 +291,7 @@ function processTick(price) {
   state.tradeInProgress = true;
   const rawStake = Math.min(state.currentStake, state.balance);
   const stake = Math.round(rawStake * 100) / 100;
-  addLog(`REAL entry – stake $${stake.toFixed(2)} (conf ${analysis.underConf.toFixed(1)}%, sum ${digitSum(price, MARKET.dp)})`);
+  addLog(`[${state.tradingMode.toUpperCase()}] Entry – stake $${stake.toFixed(2)} (conf ${analysis.underConf.toFixed(1)}%, sum ${digitSum(price, MARKET.dp)})`);
 
   state.activeRealTrade = { stake, balanceBefore: state.balance };
   
@@ -314,12 +319,12 @@ async function connectDeriv() {
   const token = (process.env.DERIV_PAT || '').trim();
 
   if (!appId || !token) {
-    addLog('Connection error: Missing DERIV_APP_ID or DERIV_PAT configurations inside Render environment.');
+    addLog('Connection error: Missing configurations inside Render environment.');
     return;
   }
 
   try {
-    addLog('Step 1/3: Fetching user profiles via fresh Options REST API...');
+    addLog(`Step 1/3: Fetching profiles via REST (Targeting: ${state.tradingMode.toUpperCase()})...`);
     
     const accountsResponse = await fetch('https://api.derivws.com/trading/v1/options/accounts', {
       method: 'GET',
@@ -331,26 +336,18 @@ async function connectDeriv() {
     });
 
     if (!accountsResponse.ok) {
-      const rawText = await accountsResponse.text().catch(() => 'No text content available');
-      console.error(`[CRITICAL DIAGNOSTIC] HTTP Status Code: ${accountsResponse.status}`);
-      console.error(`[CRITICAL DIAGNOSTIC] Raw Response Payload from Deriv: ${rawText}`);
-      
-      let parsedMessage = 'HTTP Authentication Rejected';
-      try {
-        const errObj = JSON.parse(rawText);
-        if (errObj.errors && errObj.errors[0]) {
-          parsedMessage = `${errObj.errors[0].code}: ${errObj.errors[0].message}`;
-        }
-      } catch(e) {}
-      
-      throw new Error(`Profile rejected: Status ${accountsResponse.status} (${parsedMessage})`);
+      const rawText = await accountsResponse.text().catch(() => 'No text content');
+      throw new Error(`Profile rejected: Status ${accountsResponse.status} (${rawText})`);
     }
 
     const accountsData = await accountsResponse.json();
-    const account = Array.isArray(accountsData.data) ? accountsData.data[0] : accountsData.data;
+    const accountList = Array.isArray(accountsData.data) ? accountsData.data : [accountsData.data];
     
-    if (!account || !account.account_id) {
-      throw new Error('No active Options trading accounts found mapped under this token scope.');
+    const targetMode = state.tradingMode || 'demo';
+    const account = accountList.find(acc => acc.account_type === targetMode);
+    
+    if (!account) {
+      throw new Error(`Could not find a valid "${targetMode}" account profile under this token.`);
     }
 
     const accountId = account.account_id;
@@ -375,8 +372,6 @@ async function connectDeriv() {
     });
 
     if (!otpResponse.ok) {
-      const otpRawErr = await otpResponse.text().catch(() => '');
-      console.error(`[OTP DIAGNOSTIC] HTTP Status: ${otpResponse.status} | Payload: ${otpRawErr}`);
       throw new Error('Deriv security system declined session token assignment.');
     }
 
@@ -387,7 +382,7 @@ async function connectDeriv() {
     derivWs = new WebSocket(preAuthenticatedWsUrl);
 
     derivWs.on('open', () => {
-      addLog('✅ Real-time pipeline active! Spawning asset subscription routines.');
+      addLog(`✅ Real-time pipeline active! Spawning asset subscription routines.`);
       send({ balance: 1, subscribe: 1, req_id: ++reqId });
       send({ ticks_history: MARKET.sym, count: WARMUP_TICKS, end: 'latest', req_id: ++reqId });
     });
@@ -464,7 +459,24 @@ app.get('/api/logs', (req, res) => {
 app.get('/api/state', (req, res) => res.json({ ...state, logs: undefined }));
 
 app.post('/api/control', (req, res) => {
-  const { action } = req.body;
+  const { action, mode } = req.body;
+  
+  if (action === 'set_mode') {
+    if (state.active) {
+      return res.status(400).json({ error: 'Cannot change account types while trading is active.' });
+    }
+    if (mode === 'demo' || mode === 'real') {
+      state.tradingMode = mode;
+      state.dailyStartBalance = null; 
+      state.dailyPnl = 0;
+      addLog(`⚙️ Mode switched from web interface to: ${mode.toUpperCase()}`);
+      saveState();
+      broadcastSSE({ state: sanitizeState() });
+      return res.json({ success: true, mode: state.tradingMode });
+    }
+    return res.status(400).json({ error: 'Invalid mode selection.' });
+  }
+
   if (action === 'start') {
     if (state.sessionAlreadyUsedToday) return res.status(403).json({ error: 'Session already used today.' });
     state.active = true; state.locked = false;
@@ -472,7 +484,7 @@ app.post('/api/control', (req, res) => {
     state.warmupComplete = false; state.warmupTicksFed = 0; state.liveSubscribed = false;
     state.currentStake = BASE_STAKE; state.cooldownTicksLeft = 0;
     state.tradeInProgress = false; state.activeRealTrade = null; state.settleTicksRemaining = 0;
-    addLog(`Under‑6 bot started (TP ${TP_PERCENT}%, SL ${SL_PERCENT}%).`);
+    addLog(`Under‑6 bot started on [${state.tradingMode.toUpperCase()}] (TP ${TP_PERCENT}%, SL ${SL_PERCENT}%).`);
     connectDeriv();
     saveState();
   } else if (action === 'stop') {
