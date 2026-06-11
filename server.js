@@ -1,6 +1,5 @@
 const express = require('express');
 const http = require('http');
-const https = require('https');
 const WebSocket = require('ws');
 const path = require('path');
 const fs = require('fs');
@@ -155,6 +154,7 @@ const state = {
   warmupComplete: false,
   warmupTicksFed: 0,
   liveSubscribed: false,
+  accountType: 'Unknown', // Added to trace demo vs real context
 
   tradeInProgress: false,
   activeRealTrade: null,
@@ -289,16 +289,17 @@ function processTick(price) {
   addLog(`REAL entry – stake $${stake.toFixed(2)} (conf ${analysis.underConf.toFixed(1)}%, sum ${digitSum(price, MARKET.dp)})`);
 
   state.activeRealTrade = { stake, balanceBefore: state.balance };
+  
   send({
     proposal: 1, amount: stake, basis: 'stake', currency: state.currency || 'USD',
-    duration: 1, duration_unit: 't', underlying_symbol: MARKET.sym,
+    duration: 1, duration_unit: 't', symbol: MARKET.sym,
     contract_type: 'DIGITUNDER', barrier: FIXED_BARRIER, req_id: ++reqId
   });
 
   broadcastSSE({ state: sanitizeState() });
 }
 
-// ---------- WebSocket connection (PAT → OTP) ----------
+// ---------- WebSocket connection ----------
 let derivWs = null;
 let reqId = 0;
 
@@ -306,53 +307,33 @@ function send(msg) {
   if (derivWs && derivWs.readyState === WebSocket.OPEN) derivWs.send(JSON.stringify(msg));
 }
 
-async function fetchOTP() {
-  return new Promise((resolve, reject) => {
-    const appId = process.env.DERIV_APP_ID;
-    const pat = process.env.DERIV_PAT;
-    const accountId = process.env.DERIV_ACCOUNT_ID;
-    if (!appId || !pat || !accountId) return reject(new Error('Missing credentials'));
-    const req = https.request({
-      hostname: 'api.derivws.com',
-      path: `/trading/v1/options/accounts/${accountId}/otp`,
-      method: 'POST',
-      headers: {
-        'Deriv-App-ID': appId,
-        'Authorization': `Bearer ${pat}`,
-        'Content-Type': 'application/json'
-      }
-    }, res => {
-      let body = '';
-      res.on('data', chunk => body += chunk);
-      res.on('end', () => {
-        try {
-          const data = JSON.parse(body);
-          if (data?.data?.url) resolve(data.data.url);
-          else reject(new Error(data?.error?.message || 'No OTP URL'));
-        } catch (e) { reject(e); }
-      });
-    });
-    req.on('error', reject);
-    req.end();
-  });
-}
-
 async function connectDeriv() {
   if (!state.active) return;
+  
+  const appId = process.env.DERIV_APP_ID;
+  const token = process.env.DERIV_PAT;
+
+  if (!appId || !token) {
+    addLog('Connection error: Missing DERIV_APP_ID or DERIV_PAT configuration.');
+    return;
+  }
+
   try {
-    addLog('Fetching OTP…');
-    const wsUrl = await fetchOTP();
-    derivWs = new WebSocket(wsUrl);
+    addLog('Connecting to Deriv WebSocket production endpoint...');
+    derivWs = new WebSocket(`wss://ws.derivws.com/websockets/v3?app_id=${appId}`);
+
     derivWs.on('open', () => {
-      addLog('Connected. Requesting warm‑up ticks…');
-      send({ balance: 1, subscribe: 1, req_id: ++reqId });
-      send({ ticks_history: MARKET.sym, count: WARMUP_TICKS, end: 'latest', req_id: ++reqId });
+      addLog('WebSocket open. Sending authorization request...');
+      send({ authorize: token, req_id: ++reqId });
     });
+
     derivWs.on('message', data => { try { handleMessage(JSON.parse(data)); } catch(e) {} });
+    
     derivWs.on('close', () => {
       addLog('WebSocket closed.');
       if (state.active) setTimeout(connectDeriv, 5000);
     });
+    
     derivWs.on('error', err => addLog(`WebSocket error: ${err.message}`));
   } catch (e) {
     addLog(`Connection error: ${e.message}. Retrying in 10s…`);
@@ -370,7 +351,15 @@ function handleMessage(msg) {
     return;
   }
 
-  if (msg.msg_type === 'balance') {
+  // FIXED: Detect context environment (Demo vs Real) dynamically 
+  if (msg.msg_type === 'authorize') {
+    state.accountType = msg.authorize.is_virtual ? '🧪 DEMO / VIRTUAL' : '⚠️ LIVE / REAL ACCOUNT';
+    addLog(`✅ Session Authorized for account: ${msg.authorize.loginid} (${state.accountType})`);
+    
+    send({ balance: 1, subscribe: 1, req_id: ++reqId });
+    send({ ticks_history: MARKET.sym, count: WARMUP_TICKS, end: 'latest', req_id: ++reqId });
+  }
+  else if (msg.msg_type === 'balance') {
     state.balance = parseFloat(msg.balance.balance);
     state.currency = msg.balance.currency;
     broadcastSSE({ state: sanitizeState() });
@@ -385,10 +374,6 @@ function handleMessage(msg) {
         state.liveSubscribed = true;
         addLog('✅ Warm‑up complete – subscribing to live ticks.');
         send({ ticks: MARKET.sym, req_id: ++reqId });
-        // Request balance again after warm‑up
-        setTimeout(() => {
-          send({ balance: 1, subscribe: 1, req_id: ++reqId });
-        }, 2000);
       }
       broadcastSSE({ state: sanitizeState() });
     }
@@ -440,4 +425,4 @@ app.post('/api/control', (req, res) => {
 });
 
 loadState();
-server.listen(PORT, () => console.log(`Under‑6 PAT bot on port ${PORT}`));
+server.listen(PORT, () => console.log(`Under‑6 PAT bot running on port ${PORT}`));
