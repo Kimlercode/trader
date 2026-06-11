@@ -3,54 +3,54 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Under-6 Trading Console</title>
+  <title>Under-6 Alpha Console</title>
   <style>
     :root {
-      --bg-dark: #12141c;
-      --card-bg: #1a1d29;
-      --accent-blue: #3b82f6;
-      --accent-green: #10b981;
-      --accent-red: #ef4444;
-      --text-main: #f3f4f6;
-      --text-muted: #9ca3af;
+      --bg-dark: #080a0f;
+      --card-bg: #10141e;
+      --accent-blue: #2979ff;
+      --accent-green: #00e676;
+      --accent-red: #ff1744;
+      --text-main: #f1f3f5;
+      --text-muted: #546e7a;
     }
     * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
     body { background-color: var(--bg-dark); color: var(--text-main); padding: 2rem; }
     .container { max-width: 1000px; margin: 0 auto; }
     
-    header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 2rem; border-bottom: 1px solid #2d3142; padding-bottom: 1rem; }
-    h1 { font-size: 1.5rem; font-weight: 700; color: #fff; }
+    header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 2rem; border-bottom: 1px solid #1a2232; padding-bottom: 1rem; }
+    h1 { font-size: 1.25rem; font-weight: 700; color: #fff; letter-spacing: 0.5px; }
     
-    .mode-selector { display: flex; background: #222636; padding: 0.25rem; border-radius: 8px; border: 1px solid #2d3142; }
-    .mode-btn { background: transparent; border: none; color: var(--text-muted); padding: 0.5rem 1.25rem; font-size: 0.875rem; font-weight: 600; cursor: pointer; border-radius: 6px; transition: all 0.2s; }
+    .mode-selector { display: flex; background: #161c28; padding: 0.25rem; border-radius: 6px; border: 1px solid #222c3e; }
+    .mode-btn { background: transparent; border: none; color: var(--text-muted); padding: 0.4rem 1.1rem; font-size: 0.8rem; font-weight: 600; cursor: pointer; border-radius: 4px; transition: all 0.2s; }
     .mode-btn.active.demo { background: var(--accent-blue); color: white; }
     .mode-btn.active.real { background: var(--accent-red); color: white; }
-    .mode-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+    .mode-btn:disabled { opacity: 0.2; cursor: not-allowed; }
 
     .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 1.5rem; margin-bottom: 2rem; }
-    .card { background: var(--card-bg); padding: 1.5rem; border-radius: 12px; border: 1px solid #2d3142; }
-    .card .label { font-size: 0.85rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.5rem; }
-    .card .value { font-size: 1.75rem; font-weight: 700; }
+    .card { background: var(--card-bg); padding: 1.5rem; border-radius: 8px; border: 1px solid #1a2232; }
+    .card .label { font-size: 0.75rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 0.5rem; }
+    .card .value { font-size: 1.6rem; font-weight: 700; letter-spacing: -0.5px; }
     
     .pnl-pos { color: var(--accent-green); }
     .pnl-neg { color: var(--accent-red); }
     
     .controls { display: flex; gap: 1rem; margin-bottom: 2rem; }
-    .btn { flex: 1; padding: 1rem; font-size: 1rem; font-weight: 700; border: none; border-radius: 8px; cursor: pointer; transition: background 0.2s; text-transform: uppercase; }
-    .btn-start { background: var(--accent-green); color: white; }
-    .btn-start:hover { background: #059669; }
+    .btn { flex: 1; padding: 0.85rem; font-size: 0.9rem; font-weight: 700; border: none; border-radius: 6px; cursor: pointer; transition: background 0.2s; letter-spacing: 0.5px; }
+    .btn-start { background: var(--accent-green); color: #000; }
+    .btn-start:hover { background: #00c853; }
     .btn-stop { background: var(--accent-red); color: white; }
-    .btn-stop:hover { background: #dc2626; }
-    .btn:disabled { opacity: 0.3; cursor: not-allowed; }
+    .btn-stop:hover { background: #d50000; }
+    .btn:disabled { opacity: 0.15; cursor: not-allowed; }
 
-    .status-banner { background: #1e293b; border-left: 4px solid var(--accent-blue); padding: 1rem; border-radius: 4px; margin-bottom: 2rem; font-size: 0.95rem; }
+    .status-banner { background: #0d131f; border-left: 4px solid var(--accent-blue); padding: 1rem; border-radius: 4px; margin-bottom: 2rem; font-size: 0.9rem; color: #90a4ae; }
 
-    .console { background: #090b11; border-radius: 12px; border: 1px solid #2d3142; padding: 1.5rem; }
-    .console-header { font-size: 0.9rem; font-weight: 700; color: var(--text-muted); text-transform: uppercase; margin-bottom: 1rem; border-bottom: 1px solid #2d3142; padding-bottom: 0.5rem; }
-    .log-list { height: 350px; overflow-y: auto; font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace; font-size: 0.85rem; line-height: 1.6; }
-    .log-entry { margin-bottom: 0.4rem; border-bottom: 1px solid #141722; padding-bottom: 0.4rem; display: flex; }
-    .log-time { color: var(--text-muted); margin-right: 1rem; flex-shrink: 0; }
-    .log-msg { color: #e5e7eb; white-space: pre-wrap; }
+    .console { background: #04060a; border-radius: 8px; border: 1px solid #1a2232; padding: 1.5rem; }
+    .console-header { font-size: 0.8rem; font-weight: 700; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 1rem; border-bottom: 1px solid #1a2232; padding-bottom: 0.5rem; }
+    .log-list { height: 380px; overflow-y: auto; font-family: "JetBrains Mono", Fira Code, Consolas, monospace; font-size: 0.8rem; line-height: 1.7; }
+    .log-entry { margin-bottom: 0.3rem; border-bottom: 1px solid #080c14; padding-bottom: 0.3rem; display: flex; }
+    .log-time { color: #37474f; margin-right: 1rem; flex-shrink: 0; }
+    .log-msg { color: #b0bec5; white-space: pre-wrap; }
   </style>
 </head>
 <body>
@@ -58,13 +58,13 @@
   <div class="container">
     <header>
       <div>
-        <h1>Under-6 Digit System Matrix</h1>
-        <div id="account-type" style="font-size:0.8rem; color:var(--text-muted); margin-top:0.25rem;">Checking environment...</div>
+        <h1>Under-6 Quantum Core</h1>
+        <div id="account-type" style="font-size:0.75rem; color:var(--text-muted); margin-top:0.25rem;">Routing check pending...</div>
       </div>
       
       <div class="mode-selector">
-        <button id="btn-mode-demo" class="mode-btn active demo" onclick="changeMode('demo')">Virtual Demo</button>
-        <button id="btn-mode-real" class="mode-btn real" onclick="changeMode('real')">Live Account</button>
+        <button id="btn-mode-demo" class="mode-btn active demo" onclick="changeMode('demo')">Virtual Environment</button>
+        <button id="btn-mode-real" class="mode-btn real" onclick="changeMode('real')">Live Production Portfolio</button>
       </div>
     </header>
 
@@ -72,99 +72,80 @@
 
     <div class="grid">
       <div class="card">
-        <div class="label">Current Balance</div>
+        <div class="label">Liquid Account Balance</div>
         <div id="val-balance" class="value">--</div>
       </div>
       <div class="card">
-        <div class="label">Daily Session P&L</div>
+        <div class="label">Session Alpha P&L</div>
         <div id="val-pnl" class="value">$--</div>
       </div>
       <div class="card">
-        <div class="label">Current Target Stake</div>
+        <div class="label">Fixed Allocation Stake</div>
         <div id="val-stake" class="value">--</div>
       </div>
       <div class="card">
-        <div class="label">Engine State</div>
-        <div id="val-status" class="value" style="color: var(--accent-red);">OFFLINE</div>
+        <div class="label">Core Processor Unit</div>
+        <div id="val-status" class="value" style="color: var(--accent-red);">STANDBY</div>
       </div>
     </div>
 
     <div class="controls">
-      <button id="btn-start" class="btn btn-start" onclick="triggerAction('start')">Launch Pipeline</button>
-      <button id="btn-stop" class="btn btn-stop" onclick="triggerAction('stop')" disabled>Kill Switch</button>
+      <button id="btn-start" class="btn btn-start" onclick="triggerAction('start')">Initiate Core Matrix</button>
+      <button id="btn-stop" class="btn btn-stop" onclick="triggerAction('stop')" disabled>Emergency Halt</button>
     </div>
 
     <div class="console">
-      <div class="console-header">Live System Operational Logs</div>
+      <div class="console-header">High-Fidelity Telemetry Logs</div>
       <div id="log-container" class="log-list"></div>
     </div>
   </div>
 
   <script>
     let activeLogs = [];
-
-    // Initialize Server-Sent Events stream loop
     const sse = new EventSource('/api/logs');
     
     sse.onmessage = (event) => {
       const data = JSON.parse(event.data);
-      
-      if (data.state) {
-        updateUI(data.state);
-      }
-      
+      if (data.state) updateUI(data.state);
       if (data.logs && data.logs.length > 0) {
-        // Unshift inbound real-time logs into state array tracker
         activeLogs = [...data.logs, ...activeLogs].slice(0, 200);
         renderLogs();
       }
     };
 
     function updateUI(state) {
-      // Balance formatting
       if (state.balance !== null) {
         document.getElementById('val-balance').innerText = `${parseFloat(state.balance).toFixed(2)} ${state.currency}`;
       }
-      
-      // Dynamic P&L coloring rules
       const pnlEl = document.getElementById('val-pnl');
       pnlEl.innerText = `${state.dailyPnl >= 0 ? '+' : ''}${state.dailyPnl.toFixed(2)} ${state.currency}`;
       pnlEl.className = 'value ' + (state.dailyPnl > 0 ? 'pnl-pos' : state.dailyPnl < 0 ? 'pnl-neg' : '');
 
       document.getElementById('val-stake').innerText = `$${state.currentStake.toFixed(2)}`;
-      document.getElementById('account-type').innerText = `Target Route Instance: ${state.accountType}`;
+      document.getElementById('account-type').innerText = `Current Vector: ${state.accountType}`;
 
-      // Handle active state states
       const statusEl = document.getElementById('val-status');
       if (state.locked) {
-        statusEl.innerText = "LOCKED";
-        statusEl.style.color = "var(--accent-red)";
+        statusEl.innerText = "CEASED"; statusEl.style.color = "var(--accent-red)";
       } else if (state.active) {
-        statusEl.innerText = state.warmupComplete ? "LIVE SCAN" : "WARMUP";
+        statusEl.innerText = state.warmupComplete ? "ANALYZING" : "CALIBRATING";
         statusEl.style.color = "var(--accent-green)";
       } else {
-        statusEl.innerText = "OFFLINE";
-        statusEl.style.color = "var(--accent-red)";
+        statusEl.innerText = "STANDBY"; statusEl.style.color = "var(--accent-red)";
       }
 
-      // Sync application lock notifications
       const banner = document.getElementById('banner-lock');
       if (state.locked && state.lockReason) {
-        banner.innerText = `🛑 Engine Halting Restriction: ${state.lockReason}`;
+        banner.innerText = `Restriction Flagged: ${state.lockReason}`;
         banner.style.display = 'block';
       } else {
         banner.style.display = 'none';
       }
 
-      // Sync interactive Control Elements
       document.getElementById('btn-start').disabled = state.active || state.locked;
       document.getElementById('btn-stop').disabled = !state.active;
-      
-      // Safety rule: Block structural parameters configuration manipulation while active
       document.getElementById('btn-mode-demo').disabled = state.active;
       document.getElementById('btn-mode-real').disabled = state.active;
-
-      // Sync active state select visual state
       document.getElementById('btn-mode-demo').classList.toggle('active', state.tradingMode === 'demo');
       document.getElementById('btn-mode-real').classList.toggle('active', state.tradingMode === 'real');
     }
@@ -173,12 +154,7 @@
       const container = document.getElementById('log-container');
       container.innerHTML = activeLogs.map(log => {
         const timeStr = new Date(log.time).toLocaleTimeString();
-        return `
-          <div class="log-entry">
-            <span class="log-time">[${timeStr}]</span>
-            <span class="log-msg">${log.message}</span>
-          </div>
-        `;
+        return `<div class="log-entry"><span class="log-time">[${timeStr}]</span><span class="log-msg">${log.message}</span></div>`;
       }).join('');
     }
 
@@ -189,13 +165,8 @@
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ action: 'set_mode', mode: chosenMode })
         });
-        if (!res.ok) {
-          const err = await res.json();
-          alert(err.error || 'Failed to modify account mode.');
-        }
-      } catch (e) {
-        console.error(e);
-      }
+        if (!res.ok) { const err = await res.json(); alert(err.error || 'Configuration modification denied.'); }
+      } catch (e) { console.error(e); }
     }
 
     async function triggerAction(actionName) {
@@ -205,9 +176,7 @@
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ action: actionName })
         });
-      } catch (e) {
-        console.error(e);
-      }
+      } catch (e) { console.error(e); }
     }
   </script>
 </body>
