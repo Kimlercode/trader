@@ -35,7 +35,7 @@ function sanitizeState() {
 
 // ---------- Market ----------
 const MARKET = { sym: 'R_75', name: 'Volatility 75 Index', dp: 4 };
-const FIXED_BARRIER = 5;                // DIGITUNDER barrier 5
+const FIXED_BARRIER = 5;
 const MIN_CONFIDENCE = 100;
 const DIGIT_SUM_TARGET = 23;
 const HOUSE_EDGE = 0.98;
@@ -47,10 +47,10 @@ const COOLDOWN_TICKS = 15;
 const SETTLE_TICKS = 15;
 const WARMUP_TICKS = 500;
 
-const TP_PERCENT = 5;                   // 5%
-const SL_PERCENT = 10;                  // 10%
+const TP_PERCENT = 5;
+const SL_PERCENT = 10;
 
-// ---------- Analyzer (z‑score) ----------
+// ---------- Analyzer ----------
 class Analyzer {
   constructor(dp) {
     this.dp = dp;
@@ -345,8 +345,8 @@ async function connectDeriv() {
     derivWs = new WebSocket(wsUrl);
     derivWs.on('open', () => {
       addLog('Connected. Requesting warm‑up ticks…');
-      send({ balance: 1, subscribe: 1 });
-      send({ ticks_history: MARKET.sym, count: WARMUP_TICKS, end: 'latest' });
+      send({ balance: 1, subscribe: 1, req_id: ++reqId });
+      send({ ticks_history: MARKET.sym, count: WARMUP_TICKS, end: 'latest', req_id: ++reqId });
     });
     derivWs.on('message', data => { try { handleMessage(JSON.parse(data)); } catch(e) {} });
     derivWs.on('close', () => {
@@ -385,6 +385,10 @@ function handleMessage(msg) {
         state.liveSubscribed = true;
         addLog('✅ Warm‑up complete – subscribing to live ticks.');
         send({ ticks: MARKET.sym, req_id: ++reqId });
+        // Request balance again after warm‑up
+        setTimeout(() => {
+          send({ balance: 1, subscribe: 1, req_id: ++reqId });
+        }, 2000);
       }
       broadcastSSE({ state: sanitizeState() });
     }
