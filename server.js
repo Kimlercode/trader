@@ -154,7 +154,7 @@ const state = {
   warmupComplete: false,
   warmupTicksFed: 0,
   liveSubscribed: false,
-  accountType: 'Unknown', // Added to trace demo vs real context
+  accountType: 'Connecting...',
 
   tradeInProgress: false,
   activeRealTrade: null,
@@ -299,7 +299,7 @@ function processTick(price) {
   broadcastSSE({ state: sanitizeState() });
 }
 
-// ---------- WebSocket connection ----------
+// ---------- WebSocket & REST Core Setup ----------
 let derivWs = null;
 let reqId = 0;
 
@@ -314,29 +314,88 @@ async function connectDeriv() {
   const token = process.env.DERIV_PAT;
 
   if (!appId || !token) {
-    addLog('Connection error: Missing DERIV_APP_ID or DERIV_PAT configuration.');
+    addLog('Connection error: Missing DERIV_APP_ID or DERIV_PAT configurations inside Render environment.');
     return;
   }
 
   try {
-    addLog('Connecting to Deriv WebSocket production endpoint...');
-    derivWs = new WebSocket(`wss://ws.derivws.com/websockets/v3?app_id=${appId}`);
-
-    derivWs.on('open', () => {
-      addLog('WebSocket open. Sending authorization request...');
-      send({ authorize: token, req_id: ++reqId });
+    addLog('Step 1/3: Fetching user profiles via fresh Options REST API...');
+    
+    const accountsResponse = await fetch('https://api.derivws.com/trading/v1/options/accounts', {
+      method: 'GET',
+      headers: {
+        'Deriv-App-ID': appId,
+        'Authorization': `Bearer ${token}`,
+        'Content-Type': 'application/json'
+      }
     });
 
-    derivWs.on('message', data => { try { handleMessage(JSON.parse(data)); } catch(e) {} });
+    if (!accountsResponse.ok) {
+      const errBody = await accountsResponse.json().catch(() => ({}));
+      const msg = errBody.errors ? errBody.errors[0].message : 'HTTP Authentication Rejected';
+      throw new Error(`Profile rejected: ${msg}`);
+    }
+
+    const accountsData = await accountsResponse.json();
+    const account = Array.isArray(accountsData.data) ? accountsData.data[0] : accountsData.data;
+    
+    if (!account || !account.account_id) {
+      throw new Error('No valid Options trading accounts mapped under this token.');
+    }
+
+    const accountId = account.account_id;
+    state.accountType = account.account_type === 'demo' ? '🧪 DEMO / VIRTUAL' : '⚠️ LIVE / REAL ACCOUNT';
+    state.balance = parseFloat(account.balance);
+    state.currency = account.currency || 'USD';
+    
+    if (state.dailyStartBalance === null) {
+      state.dailyStartBalance = state.balance;
+    }
+
+    addLog(`✅ Connected profile located: ${accountId} (${state.accountType})`);
+    addLog('Step 2/3: Generating secure one-time session password (OTP)...');
+
+    const otpResponse = await fetch(`https://api.derivws.com/trading/v1/options/accounts/${accountId}/otp`, {
+      method: 'POST',
+      headers: {
+        'Deriv-App-ID': appId,
+        'Authorization': `Bearer ${token}`,
+        'Content-Type': 'application/json'
+      }
+    });
+
+    if (!otpResponse.ok) {
+      throw new Error('Deriv security system declined session token assignment.');
+    }
+
+    const otpData = await otpResponse.json();
+    const preAuthenticatedWsUrl = otpData.data.url;
+
+    addLog('Step 3/3: Spawning protocol-level pre-authenticated stream...');
+    derivWs = new WebSocket(preAuthenticatedWsUrl);
+
+    derivWs.on('open', () => {
+      addLog('✅ Real-time pipeline active! Spawning asset subscription routines.');
+      
+      // Request underlying real-time subscriptions immediately
+      send({ balance: 1, subscribe: 1, req_id: ++reqId });
+      send({ ticks_history: MARKET.sym, count: WARMUP_TICKS, end: 'latest', req_id: ++reqId });
+    });
+
+    derivWs.on('message', data => { 
+      try { 
+        handleMessage(JSON.parse(data)); 
+      } catch(e) {} 
+    });
     
     derivWs.on('close', () => {
-      addLog('WebSocket closed.');
+      addLog('WebSocket session closed.');
       if (state.active) setTimeout(connectDeriv, 5000);
     });
     
-    derivWs.on('error', err => addLog(`WebSocket error: ${err.message}`));
+    derivWs.on('error', err => addLog(`Stream error: ${err.message}`));
   } catch (e) {
-    addLog(`Connection error: ${e.message}. Retrying in 10s…`);
+    addLog(`Initialization blocked: ${e.message}. Re-attempting in 10s...`);
     if (state.active) setTimeout(connectDeriv, 10000);
   }
 }
@@ -351,15 +410,7 @@ function handleMessage(msg) {
     return;
   }
 
-  // FIXED: Detect context environment (Demo vs Real) dynamically 
-  if (msg.msg_type === 'authorize') {
-    state.accountType = msg.authorize.is_virtual ? '🧪 DEMO / VIRTUAL' : '⚠️ LIVE / REAL ACCOUNT';
-    addLog(`✅ Session Authorized for account: ${msg.authorize.loginid} (${state.accountType})`);
-    
-    send({ balance: 1, subscribe: 1, req_id: ++reqId });
-    send({ ticks_history: MARKET.sym, count: WARMUP_TICKS, end: 'latest', req_id: ++reqId });
-  }
-  else if (msg.msg_type === 'balance') {
+  if (msg.msg_type === 'balance') {
     state.balance = parseFloat(msg.balance.balance);
     state.currency = msg.balance.currency;
     broadcastSSE({ state: sanitizeState() });
@@ -407,7 +458,7 @@ app.post('/api/control', (req, res) => {
   if (action === 'start') {
     if (state.sessionAlreadyUsedToday) return res.status(403).json({ error: 'Session already used today.' });
     state.active = true; state.locked = false;
-    state.dailyStartBalance = state.balance; state.dailyPnl = 0; state.lockReason = '';
+    state.dailyStartBalance = null; state.dailyPnl = 0; state.lockReason = '';
     state.warmupComplete = false; state.warmupTicksFed = 0; state.liveSubscribed = false;
     state.currentStake = BASE_STAKE; state.cooldownTicksLeft = 0;
     state.tradeInProgress = false; state.activeRealTrade = null; state.settleTicksRemaining = 0;
