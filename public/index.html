@@ -1,87 +1,234 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="UTF-8">
-<title>Under 6 Algorithmic Bot</title>
-<style>
-  * { margin:0; padding:0; box-sizing:border-box; }
-  body { font-family:'Segoe UI',Tahoma,Geneva,Verdana,sans-serif; background:#0b0f14; color:#c9d1d9; }
-  .container { max-width:650px; margin:30px auto; padding:20px; }
-  .header { display:flex; justify-content:space-between; align-items:center; margin-bottom:20px; }
-  .status-badge { padding:5px 15px; border-radius:20px; font-size:14px; font-weight:600; }
-  .status-running { background:#1a7f37; color:#fff; } .status-stopped { background:#cf222e; color:#fff; } .status-locked { background:#6e7681; color:#fff; }
-  .dashboard { display:grid; grid-template-columns:repeat(auto-fit,minmax(200px,1fr)); gap:15px; margin-bottom:25px; }
-  .card { background:#161b22; border:1px solid #30363d; border-radius:8px; padding:18px; }
-  .card h3 { font-size:12px; text-transform:uppercase; letter-spacing:0.5px; color:#8b949e; margin-bottom:8px; }
-  .value { font-size:28px; font-weight:600; } .green { color:#3fb950; } .red { color:#f85149; } .blue { color:#58a6ff; }
-  .btn { padding:12px 30px; border:none; border-radius:6px; font-weight:600; cursor:pointer; font-size:16px; }
-  .btn-start { background:#238636; color:white; } .btn-stop { background:#da3633; color:white; }
-  .btn:disabled { opacity:0.4; cursor:not-allowed; }
-  .log-container { background:#0d1117; border:1px solid #30363d; border-radius:8px; padding:15px; margin-top:20px; }
-  #logs { height:350px; overflow-y:auto; font-family:monospace; font-size:13px; line-height:1.6; }
-  .log-entry { padding:3px 0; border-bottom:1px solid #21262d; }
-  .log-entry .time { color:#58a6ff; margin-right:10px; }
-</style>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Under-6 Digit Bot Control Panel</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background-color: #0f172a;
+            color: #f8fafc;
+            margin: 0;
+            padding: 20px;
+        }
+        .container {
+            max-width: 1000px;
+            margin: 0 auto;
+        }
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 1px solid #334155;
+            padding-bottom: 20px;
+            margin-bottom: 25px;
+        }
+        h1 { margin: 0; font-size: 1.5rem; color: #38bdf8; }
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+            gap: 15px;
+            margin-bottom: 25px;
+        }
+        .card {
+            background-color: #1e293b;
+            padding: 15px;
+            border-radius: 8px;
+            border: 1px solid #334155;
+        }
+        .card-title {
+            font-size: 0.85rem;
+            color: #94a3b8;
+            text-transform: uppercase;
+            margin-bottom: 5px;
+        }
+        .card-value {
+            font-size: 1.3rem;
+            font-weight: bold;
+        }
+        .btn {
+            padding: 10px 24px;
+            border-radius: 6px;
+            font-weight: 6px;
+            cursor: pointer;
+            border: none;
+            font-size: 1rem;
+            transition: opacity 0.2s;
+        }
+        .btn:hover { opacity: 0.9; }
+        .btn-start { background-color: #10b981; color: white; }
+        .btn-stop { background-color: #ef4444; color: white; }
+        #log-container {
+            background-color: #020617;
+            border: 1px solid #334155;
+            border-radius: 8px;
+            padding: 15px;
+            height: 350px;
+            overflow-y: auto;
+            font-family: monospace;
+            font-size: 0.9rem;
+            line-height: 1.5;
+        }
+        .log-entry { margin-bottom: 4px; display: flex; }
+        .log-time { color: #64748b; margin-right: 10px; flex-shrink: 0; }
+        .log-msg { color: #e2e8f0; word-break: break-all; }
+        .status-badge {
+            padding: 4px 10px;
+            border-radius: 12px;
+            font-size: 0.8rem;
+            font-weight: bold;
+        }
+        .status-active { background-color: #065f46; color: #34d399; }
+        .status-idle { background-color: #1e293b; color: #94a3b8; }
+        .status-locked { background-color: #7f1d1d; color: #fca5a5; }
+    </style>
 </head>
 <body>
+
 <div class="container">
-  <div class="header">
-    <h1>Under 6 Algorithmic Bot</h1>
-    <span id="statusBadge" class="status-badge status-stopped">Stopped</span>
-  </div>
+    <header>
+        <div>
+            <h1>Under-6 Digit Strategy Bot</h1>
+            <div style="margin-top: 5px;">
+                Status: <span id="bot-status" class="status-badge status-idle">IDLE</span>
+            </div>
+        </div>
+        <div>
+            <button id="ctrl-btn" class="btn btn-start" onclick="toggleBot()">Start Bot</button>
+        </div>
+    </header>
 
-  <div class="dashboard">
-    <div class="card"><h3>Account Balance</h3><div class="value blue" id="balance">--</div></div>
-    <div class="card"><h3>Daily P&L</h3><div class="value" id="dailyPnl">0.00</div></div>
-    <div class="card"><h3>Take Profit (5%)</h3><div class="value green" id="tp">--</div></div>
-    <div class="card"><h3>Stop Loss (10%)</h3><div class="value red" id="sl">--</div></div>
-  </div>
+    <div class="grid">
+        <div class="card">
+            <div class="card-title">Account Type Context</div>
+            <div id="val-account" class="card-value" style="color: #a78bfa;">Connecting...</div>
+        </div>
+        <div class="card">
+            <div class="card-title">Current Balance</div>
+            <div id="val-balance" class="card-value">--</div>
+        </div>
+        <div class="card">
+            <div class="card-title">Daily Session P&L</div>
+            <div id="val-pnl" class="card-value">0.00</div>
+        </div>
+        <div class="card">
+            <div class="card-title">Warm-up Progression</div>
+            <div id="val-warmup" class="card-value">0 / 500</div>
+        </div>
+    </div>
 
-  <div style="margin:15px 0">
-    <button class="btn btn-start" id="startBtn" onclick="start()">Start Bot</button>
-    <button class="btn btn-stop" id="stopBtn" onclick="stop()" disabled>Stop Bot</button>
-  </div>
+    <div class="card" style="margin-bottom: 15px; display: none;" id="lock-reason-box">
+        <div class="card-title" style="color: #ef4444;">System Lock Reason</div>
+        <div id="val-lock-reason" style="color: #fca5a5; font-weight: bold;"></div>
+    </div>
 
-  <div class="log-container"><h2>Event Log</h2><div id="logs"></div></div>
+    <h3>Application Execution Log</h3>
+    <div id="log-container"></div>
 </div>
 
 <script>
-const logsDiv = document.getElementById('logs');
-const es = new EventSource('/api/logs');
-es.onmessage = e => {
-  const data = JSON.parse(e.data);
-  if (data.state) updateUI(data.state);
-  if (data.logs) {
-    data.logs.forEach(l => {
-      const div = document.createElement('div');
-      div.className = 'log-entry';
-      div.innerHTML = `<span class="time">${new Date(l.time).toLocaleTimeString()}</span>${l.message}`;
-      logsDiv.appendChild(div);
-    });
-    logsDiv.scrollTop = logsDiv.scrollHeight;
-  }
-};
+    let isBotActive = false;
 
-function updateUI(s) {
-  document.getElementById('balance').textContent = s.balance ? `$${parseFloat(s.balance).toFixed(2)}` : '--';
-  document.getElementById('dailyPnl').textContent = (s.dailyPnl>=0?'+':'')+s.dailyPnl.toFixed(2);
-  document.getElementById('dailyPnl').className = 'value '+(s.dailyPnl>=0?'green':'red');
-  if (s.dailyStartBalance) {
-    document.getElementById('tp').textContent = '$'+(s.dailyStartBalance*0.05).toFixed(2);
-    document.getElementById('sl').textContent = '$'+(s.dailyStartBalance*0.10).toFixed(2);
-  }
+    // Open persistent SSE channel connection to look out for live UI mutations
+    const evtSource = new EventSource("/api/logs");
 
-  const badge = document.getElementById('statusBadge');
-  if (s.locked) { badge.textContent='Locked'; badge.className='status-badge status-locked'; }
-  else if (s.active) { badge.textContent='Running'; badge.className='status-badge status-running'; }
-  else { badge.textContent='Stopped'; badge.className='status-badge status-stopped'; }
+    evtSource.onmessage = function(event) {
+        const data = JSON.parse(event.data);
+        
+        if (data.state) {
+            updateUIState(data.state);
+        }
+        if (data.logs) {
+            renderNewLogs(data.logs);
+        }
+    };
 
-  document.getElementById('startBtn').disabled = s.active || s.locked || s.sessionAlreadyUsedToday;
-  document.getElementById('stopBtn').disabled = !s.active;
-}
+    function updateUIState(state) {
+        isBotActive = state.active;
+        
+        // Update core analytics view text blocks
+        document.getElementById('val-account').innerText = state.accountType || 'Not Connected';
+        document.getElementById('val-balance').innerText = state.balance !== null ? `${state.balance.toFixed(2)} ${state.currency}` : '--';
+        
+        const pnlEl = document.getElementById('val-pnl');
+        pnlEl.innerText = state.dailyPnl.toFixed(2);
+        pnlEl.style.color = state.dailyPnl > 0 ? '#10b981' : state.dailyPnl < 0 ? '#ef4444' : '#f8fafc';
 
-function start(){ fetch('/api/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'start'})}); }
-function stop(){ fetch('/api/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'stop'})}); }
+        document.getElementById('val-warmup').innerText = state.warmupComplete ? "✅ Finished" : `${state.warmupTicksFed} / 500 Ticks`;
+
+        // Manage action button layouts
+        const btn = document.getElementById('ctrl-btn');
+        if (state.active) {
+            btn.innerText = "Stop Bot";
+            btn.className = "btn btn-stop";
+        } else {
+            btn.innerText = "Start Bot";
+            btn.className = "btn btn-start";
+        }
+
+        // Handle structural system status badges
+        const badge = document.getElementById('bot-status');
+        const lockBox = document.getElementById('lock-reason-box');
+        
+        if (state.locked) {
+            badge.innerText = "LOCKED";
+            badge.className = "status-badge status-locked";
+            lockBox.style.display = "block";
+            document.getElementById('val-lock-reason').innerText = state.lockReason;
+        } else if (state.active) {
+            badge.innerText = "RUNNING";
+            badge.className = "status-badge status-active";
+            lockBox.style.display = "none";
+        } else {
+            badge.innerText = "IDLE";
+            badge.className = "status-badge status-idle";
+            lockBox.style.display = "none";
+        }
+    }
+
+    function renderNewLogs(logs) {
+        const container = document.getElementById('log-container');
+        logs.forEach(log => {
+            const entry = document.createElement('div');
+            entry.className = 'log-entry';
+            
+            const timeSpan = document.createElement('span');
+            timeSpan.className = 'log-time';
+            timeSpan.innerText = new Date(log.time).toLocaleTimeString();
+
+            const msgSpan = document.createElement('span');
+            msgSpan.className = 'log-msg';
+            msgSpan.innerText = log.message;
+
+            entry.appendChild(timeSpan);
+            entry.appendChild(msgSpan);
+            container.insertBefore(entry, container.firstChild);
+        });
+    }
+
+    async function toggleBot() {
+        const action = isBotActive ? 'stop' : 'start';
+        try {
+            const res = await fetch('/api/control', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ action })
+            });
+            if (!res.ok) {
+                const errData = await res.json();
+                alert(`Error: ${errData.error || 'Execution failed'}`);
+            }
+        } catch (e) {
+            alert("Could not reach backend configuration interface.");
+        }
+    }
+
+    // Load static state on init window loading loop
+    fetch('/api/state')
+        .then(r => r.json())
+        .then(updateUIState)
+        .catch(() => console.error("Initial state collection faulted"));
 </script>
 </body>
 </html>
