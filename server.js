@@ -36,17 +36,19 @@ function sanitizeState() {
 const MARKET = { sym: 'R_75', name: 'Volatility 75 Index', dp: 4 };
 const FIXED_BARRIER = 6;         // Fixed to 6 (Wins on 0, 1, 2, 3, 4, 5)
 
-// The Edge Core: Trade only when losing digits (6-9) heavily saturate the feed
+// Edge Core: Trade only when losing digits (6-9) heavily saturate the feed
 const EXHAUSTION_Z_SCORE = 2.00; // Requires > 2.0 Standard Deviations of imbalance
 const MIN_STREAK = 4;            // Must see at least 4 consecutive losing digits (6-9)
 
-const BASE_STAKE = 0.35;         // Strict flat stake allocation
+// Risk Management Core
+const RISK_PERCENT = 1.5;        // Trade strictly 1.5% of account balance
+const MIN_STAKE = 0.35;          // Minimum execution floor
+const TP_PERCENT = 5;            // Target Profit at 5% of starting balance
+const SL_PERCENT = 10;           // Stop Loss at 10% of starting balance
+
 const COOLDOWN_TICKS = 25;       
 const SETTLE_TICKS = 15;
 const WARMUP_TICKS = 300;
-
-const TP_PERCENT = 10;
-const SL_PERCENT = 20;
 
 let globalTickCounter = 0;
 
@@ -116,7 +118,7 @@ const state = {
   tradeInProgress: false,
   activeRealTrade: null,
   settleTicksRemaining: 0,
-  currentStake: BASE_STAKE,
+  currentStake: MIN_STAKE,
   cooldownTicksLeft: 0,
 
   logs: [],
@@ -170,13 +172,13 @@ function checkDailyLimits() {
   if (!state.dailyStartBalance) return false;
   if (state.dailyPnl >= getTP()) {
     state.locked = true;
-    state.lockReason = `Target Target-Profit +$${getTP().toFixed(2)} secured.`;
+    state.lockReason = `Target Target-Profit +$${getTP().toFixed(2)} (${TP_PERCENT}%) secured.`;
     addLog(state.lockReason);
     return true;
   }
   if (state.dailyPnl <= -getSL()) {
     state.locked = true;
-    state.lockReason = `Emergency Stop-Loss -$${getSL().toFixed(2)} executed.`;
+    state.lockReason = `Emergency Stop-Loss -$${getSL().toFixed(2)} (${SL_PERCENT}%) executed.`;
     addLog(state.lockReason);
     return true;
   }
@@ -191,11 +193,15 @@ function settleRealTrade() {
   
   addLog(`[${state.tradingMode.toUpperCase()}] ${result}: ${profit > 0 ? '+' : ''}${profit.toFixed(2)} | Session P&L: ${state.dailyPnl.toFixed(2)}`);
 
-  state.currentStake = BASE_STAKE; // Always Flat Stake
   state.tradeInProgress = false;
   state.activeRealTrade = null;
   state.settleTicksRemaining = 0;
   state.cooldownTicksLeft = COOLDOWN_TICKS;
+
+  // Pre-calculate next potential stake for UI display accuracy
+  const nextCalculatedRisk = state.balance * (RISK_PERCENT / 100);
+  const nextRawStake = Math.min(Math.max(MIN_STAKE, nextCalculatedRisk), state.balance);
+  state.currentStake = Math.round(nextRawStake * 100) / 100;
 
   checkDailyLimits();
   saveState();
@@ -230,14 +236,22 @@ function processTick(price) {
   if (metrics.zScore >= EXHAUSTION_Z_SCORE && metrics.currentStreak >= MIN_STREAK) {
     state.tradeInProgress = true;
     
-    const stake = Math.round(Math.min(BASE_STAKE, state.balance) * 100) / 100;
-    addLog(`🎯 EXHAUSTION DETECTED! Losing numbers cluster over-extended (Streak: ${metrics.currentStreak}, Z-Score: ${metrics.zScore.toFixed(2)}). Order: DIGITUNDER 6`);
+    // Dynamic Risk Allocation: 1.5% of balance, floor of $0.35, strict 2 decimal places
+    let calculatedRisk = state.balance * (RISK_PERCENT / 100);
+    let rawStake = Math.max(MIN_STAKE, calculatedRisk); // Enforce $0.35 minimum
+    rawStake = Math.min(rawStake, state.balance);       // Prevent allocating more than total balance
+    const stake = Math.round(rawStake * 100) / 100;     // Format to strictly 2 decimal places
+    
+    state.currentStake = stake; // Update telemetry state
+
+    addLog(`🎯 EXHAUSTION DETECTED! Allocating $${stake.toFixed(2)} (1.5% Risk Factor). Order: DIGITUNDER 6`);
 
     state.activeRealTrade = { stake, balanceBefore: state.balance };
     
+    // API updated to use underlying_symbol
     send({
       proposal: 1, amount: stake, basis: 'stake', currency: state.currency || 'USD',
-      duration: 1, duration_unit: 't', symbol: MARKET.sym,
+      duration: 1, duration_unit: 't', underlying_symbol: MARKET.sym,
       contract_type: 'DIGITUNDER', barrier: FIXED_BARRIER, req_id: ++reqId
     });
 
