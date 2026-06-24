@@ -20,35 +20,35 @@ const STATE_FILE = '/var/data/deriv_multimarket_state.json';
 // =====================================================================
 const CONFIG = {
     // ---------- Gap Range ----------
-    MIN_GAP_OVER: 11,           // Minimum gap for OVER (>=)
-    MAX_GAP_OVER: 14,           // Maximum gap for OVER (<=)
-    MIN_GAP_UNDER: -14,         // Minimum (most negative) gap for UNDER (<=)
-    MAX_GAP_UNDER: -11,         // Maximum (least negative) gap for UNDER (>=)
+    MIN_GAP_OVER: 11,
+    MAX_GAP_OVER: 14,
+    MIN_GAP_UNDER: -14,
+    MAX_GAP_UNDER: -11,
 
     // ---------- Digit Pattern Parameters ----------
-    OVER_4TH_PREV: [7, 8, 9],   // 4th previous digit must be in this list
-    OVER_LAST3_RANGE: [0, 3],   // last 3 digits must be between 0 and 3 (inclusive)
+    OVER_4TH_PREV: [7, 8, 9],
+    OVER_LAST3_RANGE: [0, 3],
     UNDER_4TH_PREV: [0, 1, 2, 3],
-    UNDER_LAST3_RANGE: [7, 9],  // last 3 digits must be between 7 and 9
+    UNDER_LAST3_RANGE: [7, 9],
 
     // ---------- Timing & Cooldowns ----------
-    MIN_TRIGGER_INTERVAL: 20000, // 20 seconds between ANY automated trade
-    MAX_CONSECUTIVE_LOSSES: 2,   // Number of losses before longer cooldown
-    LOSS_COOLDOWN_MS: 120000,    // 2 minutes after max consecutive losses
+    MIN_TRIGGER_INTERVAL: 20000,
+    MAX_CONSECUTIVE_LOSSES: 2,
+    LOSS_COOLDOWN_MS: 120000,
 
-    // ---------- Risk Management ----------
-    RISK_PERCENT: 1,             // Stake as % of balance
-    TP_PERCENT: 5,               // Daily take-profit % (pauses trading, does NOT disarm autotrade)
-    SL_PERCENT: 10,              // Daily stop-loss % (pauses trading, does NOT disarm autotrade)
+    // ---------- Risk Management (DAILY = 24h rolling) ----------
+    RISK_PERCENT: 1,
+    TP_PERCENT: 5,
+    SL_PERCENT: 10,
     MIN_STAKE: 0.35,
 
     // ---------- Trade Execution ----------
-    COOLDOWN_TICKS: 1,           // Ticks to wait after settlement before next trade
-    SETTLE_TICKS: 5,             // Ticks to wait before checking balance
-    SETTLEMENT_TIMEOUT_MS: 10000, // Fallback timeout for balance update
+    COOLDOWN_TICKS: 1,
+    SETTLE_TICKS: 5,
+    SETTLEMENT_TIMEOUT_MS: 10000,
 
     // ---------- P&L Sync ----------
-    PNL_SYNC_INTERVAL_MS: 300000  // 5 minutes – sync daily P&L from DB
+    PNL_SYNC_INTERVAL_MS: 300000
 };
 // =====================================================================
 
@@ -63,12 +63,11 @@ function scheduleRestart() {
   const delay = nextMidnightUTC.getTime() - now;
   console.log(`⏰ Next restart scheduled at ${nextMidnightUTC.toISOString()} (03:00 EAT)`);
   setTimeout(() => {
-    console.log('🔄 Scheduled restart at 03:00 EAT. Resetting daily state and restarting...');
-    // Reset daily limits and lock, but keep 'active' as is (it will be restored from state)
-    state.dailyPnl = 0;
+    console.log('🔄 Scheduled restart at 03:00 EAT. Resetting and restarting...');
+    // Keep active as is, but reset daily lock – will be re‑evaluated from DB after restart
+    state.sessionPnl = 0;
     state.locked = false;
     state.lockReason = '';
-    // Recompute dailyStartBalance from DB after restart, not here.
     saveState();
     process.exit(0);
   }, delay);
@@ -98,14 +97,11 @@ app.get('/api/ledger/analytics', async (req, res) => {
   const { start, end, mode } = req.query;
 
   if (mode === 'session') {
-    // Use the 24h P&L from state
-    const settlements = state.logs ? state.logs.filter(l => l.message.includes('Settlement')) : [];
-    const wins = settlements.filter(l => l.message.includes('WIN')).length;
-    const strikeRate = settlements.length > 0 ? ((wins / settlements.length) * 100).toFixed(1) : 0;
+    // Session = in‑memory P&L since last start/restart
     return res.json({
-      totalProfit: state.dailyPnl || 0,
-      strikeRate: strikeRate,
-      totalTrades: settlements.length,
+      totalProfit: state.sessionPnl || 0,
+      strikeRate: '0',
+      totalTrades: 0,
       rawData: []
     });
   }
@@ -222,7 +218,9 @@ app.post('/api/control', (req, res) => {
 
   if (action === 'start') {
     if (state.locked) {
-      return res.status(400).json({ error: 'System is paused due to daily limit breach. It will resume at midnight.' });
+      return res.status(400).json({ 
+        error: `System is paused: ${state.lockReason}` 
+      });
     }
     state.active = true;
     addLog('🔓 Automation matrix ARMED by user.');
@@ -314,7 +312,6 @@ class MultiMarketPipeline {
       symbol,
       pcts,
       totalGap,
-      // kept for compatibility
       greenCircle: 0,
       densityOver3: Math.round((ticks.filter(d => d > 3).length / BUFFER_CAPACITY) * 100),
       last3: ticks.slice(-3)
@@ -325,14 +322,21 @@ class MultiMarketPipeline {
 const engine = new MultiMarketPipeline();
 
 const state = {
-  active: false,               // User's arming state – persists across restarts
+  active: false,                // User arming state – persists across restarts
   tradingMode: 'demo',
   balance: null,
   currency: 'USD',
-  dailyStartBalance: null,     // computed as currentBalance - dailyPnl (from 24h history)
-  dailyPnl: 0,                 // sum of profit_loss from last 24h
-  locked: false,               // Paused due to daily limit – does NOT change active
+  
+  // --- P&L Values ---
+  sessionPnl: 0,                // In‑memory P&L since last start (resets on redeploy)
+  dailyPnl: 0,                  // 24h rolling P&L from database (persists)
+  dailyStartBalance: null,      // balance - dailyPnl (computed from DB)
+  
+  // --- Lock State ---
+  locked: false,                // Paused due to daily limit – does NOT change active
   lockReason: '',
+  
+  // --- Trade State ---
   tradeInProgress: false,
   activeRealTrade: null,
   settleTicksRemaining: 0,
@@ -388,13 +392,13 @@ function checkDailyLimits() {
 
   if (state.dailyPnl >= tpLimit) {
     state.locked = true;
-    state.lockReason = `🎯 Target Achieved: 24h P&L +$${state.dailyPnl.toFixed(2)} (${CONFIG.TP_PERCENT}% of start). Trading paused. Autotrade will resume at midnight.`;
+    state.lockReason = `🎯 Daily Target Reached: +$${state.dailyPnl.toFixed(2)} (${CONFIG.TP_PERCENT}% of start). Trading paused. Will resume at midnight.`;
     addLog(state.lockReason);
     return true;
   }
   if (state.dailyPnl <= -slLimit) {
     state.locked = true;
-    state.lockReason = `🛑 Risk Limit Breached: 24h P&L -$${Math.abs(state.dailyPnl).toFixed(2)} (${CONFIG.SL_PERCENT}% of start). Trading paused. Autotrade will resume at midnight.`;
+    state.lockReason = `🛑 Daily Loss Limit Breached: -$${Math.abs(state.dailyPnl).toFixed(2)} (${CONFIG.SL_PERCENT}% of start). Trading paused. Will resume at midnight.`;
     addLog(state.lockReason);
     return true;
   }
@@ -417,7 +421,7 @@ function saveState() {
       tradingMode: state.tradingMode,
       locked: state.locked,
       lockReason: state.lockReason,
-      sessionActive: state.active   // Save the arming state
+      sessionActive: state.active
     }));
   } catch(e) {}
 }
@@ -433,10 +437,9 @@ function loadState() {
         state.lockReason = saved.lockReason || '';
         state.active = saved.sessionActive || false;
       } else {
-        // New day: reset lock but keep active as is (user might have armed it yesterday)
+        // New day: reset lock but keep active as is
         state.locked = false;
         state.lockReason = '';
-        // We keep state.active as is (restored from saved or false)
         state.active = saved.sessionActive || false;
       }
     }
@@ -456,7 +459,11 @@ function settleRealTrade() {
   }
 
   const profit = state.balance - state.activeRealTrade.balanceBefore;
-  // Update local dailyPnl – will be overwritten by DB sync, but good for UI responsiveness
+  
+  // Update session P&L (in‑memory, resets on restart)
+  state.sessionPnl += profit;
+  
+  // Update daily P&L (will be overwritten by DB sync, but good for UI)
   state.dailyPnl += profit;
 
   const isWin = profit >= 0;
@@ -485,7 +492,7 @@ function settleRealTrade() {
     exitTick: state.activeRealTrade.exitTick
   });
 
-  addLog(`[Settlement] Asset: ${state.activeRealTrade.symbol} | Result: ${isWin ? '🟢 WIN (+$' : '🔴 LOSS (-$'}${Math.abs(profit).toFixed(2)}) | 24h Net: $${state.dailyPnl.toFixed(2)}`);
+  addLog(`[Settlement] ${state.activeRealTrade.symbol} | Result: ${isWin ? '🟢 WIN (+$' : '🔴 LOSS (-$'}${Math.abs(profit).toFixed(2)}) | Session: $${state.sessionPnl.toFixed(2)} | 24h: $${state.dailyPnl.toFixed(2)}`);
 
   state.tradeInProgress = false;
   state.activeRealTrade = null;
@@ -561,26 +568,26 @@ function processLiveFeed(symbol, price) {
 
   // 7. Evaluate each market using new pattern
   let bestCandidate = null;
-  let bestScore = -Infinity; // we'll use absolute gap as score
+  let bestScore = -Infinity;
 
   for (const sym in MARKETS) {
     const buffer = engine.buffers[sym];
-    if (buffer.length < 4) continue; // need at least 4 ticks
+    if (buffer.length < 4) continue;
 
     const gap = state.marketMetrics[sym]?.totalGap;
     if (gap === undefined) continue;
 
-    const last4 = buffer.slice(-4); // [t-3, t-2, t-1, t] where t is latest
+    const last4 = buffer.slice(-4);
     const fourthPrev = last4[0];
-    const lastThree = last4.slice(1); // [t-2, t-1, t]
+    const lastThree = last4.slice(1);
 
-    // Check OVER condition: gap in [MIN_GAP_OVER, MAX_GAP_OVER]
+    // OVER condition: gap in [MIN_GAP_OVER, MAX_GAP_OVER]
     if (gap >= CONFIG.MIN_GAP_OVER && gap <= CONFIG.MAX_GAP_OVER) {
       if (CONFIG.OVER_4TH_PREV.includes(fourthPrev)) {
         const allInRange = lastThree.every(d => d >= CONFIG.OVER_LAST3_RANGE[0] && d <= CONFIG.OVER_LAST3_RANGE[1]);
         const allDistinct = (new Set(lastThree)).size === 3;
         if (allInRange && allDistinct) {
-          const score = gap; // positive, larger is better
+          const score = gap;
           if (score > bestScore) {
             bestScore = score;
             bestCandidate = { symbol: sym, direction: 'OVER', barrier: 3, gap, last4 };
@@ -589,13 +596,13 @@ function processLiveFeed(symbol, price) {
       }
     }
 
-    // Check UNDER condition: gap in [MIN_GAP_UNDER, MAX_GAP_UNDER]
+    // UNDER condition: gap in [MIN_GAP_UNDER, MAX_GAP_UNDER]
     if (gap >= CONFIG.MIN_GAP_UNDER && gap <= CONFIG.MAX_GAP_UNDER) {
       if (CONFIG.UNDER_4TH_PREV.includes(fourthPrev)) {
         const allInRange = lastThree.every(d => d >= CONFIG.UNDER_LAST3_RANGE[0] && d <= CONFIG.UNDER_LAST3_RANGE[1]);
         const allDistinct = (new Set(lastThree)).size === 3;
         if (allInRange && allDistinct) {
-          const score = -gap; // negative gap, more negative is better (we use absolute)
+          const score = -gap;
           if (score > bestScore) {
             bestScore = score;
             bestCandidate = { symbol: sym, direction: 'UNDER', barrier: 6, gap, last4 };
@@ -681,7 +688,10 @@ async function connectDeriv() {
     state.balance = parseFloat(targetAccount.balance);
     state.currency = targetAccount.currency || 'USD';
 
-    // Sync daily P&L from DB to compute dailyStartBalance
+    // Reset session P&L on fresh connection
+    state.sessionPnl = 0;
+
+    // Sync daily P&L from DB to compute dailyStartBalance and check limits
     await syncDailyPnlFromDB();
 
     broadcastSSE({ state: sanitizeState() });
@@ -697,7 +707,7 @@ async function connectDeriv() {
     derivWs = new WebSocket(otpData.data.url);
 
     derivWs.on('open', () => {
-      addLog(`🌐 Pipeline Connected. Balance: $${state.balance.toFixed(2)} | 24h P&L: $${state.dailyPnl.toFixed(2)}`);
+      addLog(`🌐 Connected. Balance: $${state.balance.toFixed(2)} | Session: $${state.sessionPnl.toFixed(2)} | 24h: $${state.dailyPnl.toFixed(2)}`);
       send({ balance: 1, subscribe: 1, req_id: ++reqId });
       for (const key in MARKETS) send({ ticks_history: key, count: BUFFER_CAPACITY, end: 'latest', req_id: ++reqId });
 
@@ -756,7 +766,6 @@ function handleMessage(msg) {
       state.pendingSettlement = false;
       settleRealTrade();
     }
-    // Also update dailyStartBalance in case balance changed externally
     if (state.dailyPnl !== undefined) {
       state.dailyStartBalance = state.balance - state.dailyPnl;
     }
@@ -785,7 +794,9 @@ app.post('/api/manual-trade', (req, res) => {
   const { symbol, contractType } = req.body;
 
   if (state.locked || state.tradeInProgress) {
-    return res.status(400).json({ error: 'System locked or trade in progress.' });
+    return res.status(400).json({ 
+      error: state.locked ? state.lockReason : 'Trade in progress.' 
+    });
   }
   if (!MARKETS[symbol]) {
     return res.status(400).json({ error: 'Invalid symbol.' });
